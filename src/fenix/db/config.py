@@ -14,3 +14,13 @@ class Config(TypedDict, total=False):
     select: Select | None
     column: str
     metric: Metric
+
+
+def default_config() -> Config:
+    return {
+        "limit": 10,
+        "filter": None,
+        "select": None,
+        "column": "vector",
+        "metric": "l2",
+    }
