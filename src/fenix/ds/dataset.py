@@ -3,11 +3,11 @@ import os
 import duckdb
 import pyarrow as pa
 
-from fenix.db.client import Client
-from fenix.db.config import Config, default_config
+from fenix.ds.config import Config, default_config
+from fenix.ds.engine import Engine
 
 
-class Engine(Client, frozen=True):
+class Dataset(Engine, frozen=True):
     uri: str = "./data/fenix.ddb"
 
     def __post_init__(self) -> None:
@@ -19,7 +19,7 @@ class Engine(Client, frozen=True):
         with duckdb.connect(self.uri, read_only=True) as conn:
             return [name for (name,) in conn.execute("SHOW TABLES").fetchall()]
 
-    def put(self, name: str, data: pa.Table) -> "Engine":
+    def put(self, name: str, data: pa.Table) -> "Dataset":
         with duckdb.connect(self.uri) as conn:
             table = conn.from_arrow(data)
 
@@ -36,7 +36,7 @@ class Engine(Client, frozen=True):
         with duckdb.connect(self.uri, read_only=True) as conn:
             return conn.table(name).record_batch()
 
-    def drop(self, name: str) -> "Engine":
+    def drop(self, name: str) -> "Dataset":
         with duckdb.connect(self.uri) as conn:
             conn.sql(f"DROP TABLE IF EXISTS {name}")
 

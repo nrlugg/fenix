@@ -5,12 +5,12 @@ import msgspec
 import pyarrow as pa
 import pyarrow.flight as fl
 
-from fenix.db.client import Client
-from fenix.db.config import Config, default_config
-from fenix.db.engine import Engine
+from fenix.ds.config import Config, default_config
+from fenix.ds.dataset import Dataset
+from fenix.ds.engine import Engine
 
 
-class Flight(fl.FlightServerBase):
+class FlightServer(fl.FlightServerBase):
     def __init__(
         self,
         database: str = "./data/fenix.ddb",
@@ -18,7 +18,7 @@ class Flight(fl.FlightServerBase):
     ) -> None:
         super().__init__(location=location)
 
-        self.engine = Engine(database)
+        self.dataset = Dataset(database)
         self.location = location if location is not None else f"grpc://0.0.0.0:{self.port}"
 
     def get_flight_info(
@@ -27,7 +27,7 @@ class Flight(fl.FlightServerBase):
         descriptor: fl.FlightDescriptor,
     ) -> fl.FlightInfo:
         name = descriptor.path[0].decode()
-        data = self.engine.get(name)
+        data = self.dataset.get(name)
 
         return fl.FlightInfo(
             schema=data.schema,
@@ -42,7 +42,7 @@ class Flight(fl.FlightServerBase):
         ctx: fl.ServerCallContext,
         criteria: bytes,
     ) -> Iterator[fl.FlightDescriptor]:
-        for name in self.engine.list_tables():
+        for name in self.dataset.list_tables():
             yield self.get_flight_info(
                 ctx,
                 fl.FlightDescriptor.for_path(name),
@@ -55,14 +55,14 @@ class Flight(fl.FlightServerBase):
         reader: fl.MetadataRecordBatchReader,
         writer: fl.FlightMetadataWriter,
     ) -> None:
-        self.engine.put(
+        self.dataset.put(
             descriptor.path[0].decode(),
             reader.read_all(),
         )
 
     def do_get(self, ctx: fl.ServerCallContext, ticket: fl.Ticket):
         name = ticket.ticket.decode()
-        data = self.engine.get(name)
+        data = self.dataset.get(name)
 
         return fl.GeneratorStream(data.schema, data)
 
@@ -73,7 +73,7 @@ class Flight(fl.FlightServerBase):
         reader: fl.MetadataRecordBatchReader,
         writer: fl.MetadataRecordBatchWriter,
     ) -> None:
-        data = self.engine.search(
+        data = self.dataset.search(
             query=reader.read_all(),
             index=descriptor.path[0].decode(),
             config=msgspec.json.decode(descriptor.path[1]),
@@ -84,26 +84,26 @@ class Flight(fl.FlightServerBase):
 
     def do_action(self, ctx: fl.ServerCallContext, action: fl.Action) -> None:
         if action.type == "drop":
-            self.engine.drop(
+            self.dataset.drop(
                 action.body.to_pybytes().decode(),
             )
 
 
-class Remote(Client, frozen=True, dict=True):
+class FlightDataset(Engine, frozen=True, dict=True):
     uri: str
 
     @functools.cached_property
-    def flight(self) -> fl.FlightClient:
+    def client(self) -> fl.FlightClient:
         return fl.connect(self.uri)
 
     def list_tables(self) -> list[str]:
         return [
-            flight.endpoints[0].ticket.ticket.decode() for flight in self.flight.list_flights()
+            flight.endpoints[0].ticket.ticket.decode() for flight in self.client.list_flights()
         ]
 
-    def put(self, name: str, data: pa.RecordBatchReader) -> "Remote":
+    def put(self, name: str, data: pa.RecordBatchReader) -> "FlightDataset":
         descriptor = fl.FlightDescriptor.for_path(name)
-        writer, reader = self.flight.do_put(descriptor, data.schema)
+        writer, reader = self.client.do_put(descriptor, data.schema)
 
         for batch in data:
             writer.write_batch(batch)
@@ -113,13 +113,13 @@ class Remote(Client, frozen=True, dict=True):
         return self
 
     def get(self, name: str) -> pa.RecordBatchReader:
-        flight = self.flight.get_flight_info(fl.FlightDescriptor.for_path(name))
+        flight = self.client.get_flight_info(fl.FlightDescriptor.for_path(name))
         ticket = flight.endpoints[0].ticket
-        reader = self.flight.do_get(ticket)
+        reader = self.client.do_get(ticket)
         return reader.to_reader()
 
-    def drop(self, name: str) -> "Remote":
-        self.flight.do_action(
+    def drop(self, name: str) -> "FlightDataset":
+        self.client.do_action(
             fl.Action("drop", name.encode()),
         )
 
@@ -136,7 +136,7 @@ class Remote(Client, frozen=True, dict=True):
             msgspec.json.encode(config if config else default_config()),
         )
 
-        writer, reader = self.flight.do_exchange(descriptor)
+        writer, reader = self.client.do_exchange(descriptor)
 
         with writer:
             writer.begin(query.schema)
