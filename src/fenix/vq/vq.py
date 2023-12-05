@@ -27,6 +27,9 @@ def build_quantization(
     metric: str = "l2",
     epochs: int = 50,
 ) -> Tensor:
+    if p > 1 and metric == "cosine":
+        raise ValueError("Cannot use product quantization (p > 1) with 'cosine' metric")
+
     x = x.view(x.size(0), p, x.size(-1) // p)
     x = x.transpose(0, 1)
 
