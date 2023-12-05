@@ -23,6 +23,7 @@ dependencies = [
     "typer>=0.9.0",
     "psutil>=5.9.6",
     "multiprocess>=0.70.15",
+    "jmespath>=1.0.1",
 ]
 
 [tool.pdm.dev-dependencies]
