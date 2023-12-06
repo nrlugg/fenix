@@ -34,23 +34,23 @@ class QUInt8NDArray(np.ndarray):
             tensor.q_zero_point(),
         )
 
-    @staticmethod
-    def from_float(array: ArrayLike) -> "QUInt8NDArray":
-        return QUInt8NDArray.from_torch(
-            torch.from_numpy(
-                np.asarray(array, dtype=np.float32),
-            )
-        )
-
-    def to_float(self) -> NDArray[np.float32]:
-        return self.scale * (self.astype(np.float32) - self.shift)
-
     def to_torch(self) -> Tensor:
         return torch._make_per_tensor_quantized_tensor(
             torch.from_numpy(self),
             self.scale,
             self.shift,
         )
+
+    @staticmethod
+    def quantize(array: ArrayLike) -> "QUInt8NDArray":
+        return QUInt8NDArray.from_torch(
+            torch.from_numpy(
+                np.asarray(array, dtype=np.float32),
+            )
+        )
+
+    def dequantize(self) -> NDArray[np.float32]:
+        return self.scale * (self.astype(np.float32).view(np.ndarray) - self.shift)
 
 
 class QUInt8TensorType(pa.ExtensionType):
