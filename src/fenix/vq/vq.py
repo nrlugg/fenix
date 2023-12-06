@@ -21,12 +21,14 @@ def distance(u: Tensor, v: Tensor, metric: str = "l2") -> Tensor:
 
 def build_quantization(
     x: Tensor,
-    k: int = 256,
+    k: int,
     n: int = 1,
     f: int = 256,
     metric: str = "l2",
     epochs: int = 50,
 ) -> Tensor:
+    x = x.dequantize()
+
     i = torch.randperm(x.size(0))[:k]
     q = x[i]
 
@@ -36,8 +38,8 @@ def build_quantization(
 
         d = distance(v, q, metric=metric)
 
-        i = d.argmin(dim=-1)
-        q = q.index_put_((i,), v, accumulate=True)
+        i = torch.argmin(d, dim=-1)
+        q = torch.index_put_(q, (i,), v, accumulate=True)
 
         c = i[None, :] == torch.arange(k)[:, None]
         c = torch.sum(c, dim=-1, keepdim=True) + 1
@@ -48,8 +50,6 @@ def build_quantization(
 
     if n > 1:
         i = apply_quantization(x, q, metric=metric).squeeze(1)
-        x = x - q[0, i]
-
         q = torch.concatenate(
             [
                 q,
@@ -62,6 +62,8 @@ def build_quantization(
 
 
 def apply_quantization(x: Tensor, q: Tensor, metric: str = "l2") -> Tensor:
+    x = x.dequantize()
+    q = q.dequantize()
     n = q.size(0)
 
     d = distance(x, q[0], metric=metric)
