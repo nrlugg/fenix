@@ -127,7 +127,9 @@ class QUInt8TensorArray(pa.ExtensionArray):
                 tensor.to_torch(),
             )
 
-        return QUInt8TensorArray.from_float(tensor)
+        return QUInt8TensorArray.from_numpy(
+            QUInt8NDArray.quantize(tensor),
+        )
 
     def to_torch(self) -> Tensor:
         *_, buff = self.buffers()
