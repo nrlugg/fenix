@@ -7,6 +7,7 @@ import msgspec
 import numpy as np
 import pyarrow as pa
 import torch
+import xxhash
 
 import fenix.vq as vq
 
@@ -26,7 +27,7 @@ class SearchSelect(TypedDict):
     table: list[str]
 
 
-class SeachParams(TypedDict, total=False):
+class SearchParams(TypedDict, total=False):
     limit: int
     filter: str | None
     select: SearchSelect | None
@@ -34,7 +35,7 @@ class SeachParams(TypedDict, total=False):
     metric: str
 
 
-def default_search_params() -> SeachParams:
+def default_search_params() -> SearchParams:
     return {
         "limit": 10,
         "filter": None,
@@ -146,11 +147,14 @@ class Dataset(msgspec.Struct, frozen=True):
 
     def search(
         self,
-        query: pa.Table,
         table: str,
-        params: SeachParams | None = None,
+        query: pa.Table,
+        params: SearchParams | None = None,
     ) -> pa.Table:
         params = default_search_params() | params if params else default_search_params()
+
+        QUERY = xxhash.xxh64(msgspec.msgpack.encode(params)).hexdigest()
+        QUERY = f"query_{table}_{QUERY}"
 
         query = query.select(params["select"]["query"]) if params["select"] is not None else query
 
@@ -169,7 +173,7 @@ class Dataset(msgspec.Struct, frozen=True):
 
             params["metric"] = q["conf"]["metric"]
             params["column"] = q["conf"]["column"]
-            filter = "query_.group_id = table_.group_id"
+            filter = f"{QUERY}.group_id = {table}.group_id"
             params["filter"] = (
                 filter if params["filter"] is None else " AND ".join([filter, params["filter"]])
             )
@@ -186,14 +190,14 @@ class Dataset(msgspec.Struct, frozen=True):
             else "list_distance"
         )
 
-        self.create_table("query_", query)
+        self.create_table(QUERY, query)
 
         with self.connect(read_only=True) as conn:
             limit = params["limit"]
             column = params["column"]
-            filter = f"WHERE {params['filter']}" if params["filter"] else ""
+            filter = f"{params['filter']}" if params["filter"] else ""
             select = [
-                *[name for name in conn.table("query_").columns if name != "group_id"],
+                *[name for name in conn.table(QUERY).columns if name != "group_id"],
                 *[
                     f"{name} AS index_{name}" if name != "group_id" else name
                     for name in conn.table(table).columns
@@ -202,31 +206,22 @@ class Dataset(msgspec.Struct, frozen=True):
                 "distance",
             ]
 
-            print(conn.sql("SELECT * FROM query_"))
-
             data = (
                 conn.sql(
                     f"""
                     SELECT
-                        query_.*
-                    ,   table_.*
-                    FROM query_, LATERAL(
-                            SELECT
-                                *
-                            ,   {func}(query_.query_{column}, {table}.{column}) AS distance
-                            FROM
-                                {table}
-                            ORDER BY distance ASC
-                            OFFSET 1
-                            LIMIT {limit}
-                        ) AS table_
-                    ORDER BY distance ASC
+                      {QUERY}.*
+                    , {table}.*
+                    , {func}({QUERY}.query_{column}, {table}.{column}) AS distance
+                    FROM {QUERY} INNER JOIN {table} ON {filter}
+                    QUALIFY ROW_NUMBER() OVER(PARTITION BY {QUERY}.query_id ORDER BY distance ASC) <= {limit}
+                    ORDER BY {QUERY}.query_id ASC, distance ASC
                     """
                 )
                 .project(", ".join(select))
                 .to_arrow_table()
             )
 
-        self.remove_table("query_")
+        self.remove_table(QUERY)
 
         return data
