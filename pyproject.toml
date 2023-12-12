@@ -24,6 +24,7 @@ dependencies = [
     "psutil>=5.9.6",
     "multiprocess>=0.70.15",
     "jmespath>=1.0.1",
+    "xxhash>=3.4.1",
 ]
 
 [tool.pdm.dev-dependencies]
