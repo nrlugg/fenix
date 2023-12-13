@@ -29,6 +29,7 @@ class SearchSelect(TypedDict):
 
 class SearchParams(TypedDict, total=False):
     limit: int
+    probes: int
     filter: str | None
     select: SearchSelect | None
     column: str
@@ -38,6 +39,7 @@ class SearchParams(TypedDict, total=False):
 def default_search_params() -> SearchParams:
     return {
         "limit": 10,
+        "probes": 1,
         "filter": None,
         "select": None,
         "column": "vector",
@@ -68,38 +70,32 @@ class Dataset(msgspec.Struct, frozen=True):
         with self.connect(read_only=True) as conn:
             return [name for (name,) in conn.execute("SHOW TABLES").fetchall()]
 
-    def create_table(self, name: str, data: pa.Table) -> "Dataset":
+    def create_table(self, name: str, data: pa.Table) -> None:
         assert name not in self.list_tables()
 
         with self.connect() as conn:
             table = conn.from_arrow(data)
             table.create(name)
 
-        return self
-
-    def update_table(self, name: str, data: pa.Table) -> "Dataset":
+    def update_table(self, name: str, data: pa.Table) -> None:
         assert name in self.list_tables()
 
         with self.connect() as conn:
             table = conn.from_arrow(data)
             table.insert_into(name)
 
-        return self
-
-    def remove_table(self, name: str) -> "Dataset":
+    def remove_table(self, name: str) -> None:
         if name not in self.list_tables():
-            return self
+            return
 
         with self.connect() as conn:
             conn.sql(f"DROP TABLE IF EXISTS {name}")
-
-        return self
 
     def to_pyarrow(self, name: str, batch_size: int = 32_000) -> pa.RecordBatchReader:
         with duckdb.connect(self.uri, read_only=True) as conn:
             return conn.table(name).record_batch(batch_size)
 
-    def create_index(self, name: str, conf: IndexConfig) -> "Dataset":
+    def create_index(self, name: str, conf: IndexConfig) -> None:
         with self.connect() as conn:
             t = conn.sql(
                 f"SELECT * FROM {name} USING SAMPLE {conf['sample']} ROWS"
@@ -129,7 +125,7 @@ class Dataset(msgspec.Struct, frozen=True):
             )
 
             q = vq.apply_quantization(x, q, metric=conf["metric"])
-            q = vq.index_quantization(q, k=conf["k"])
+            q = vq.index_quantization(q, k=1).squeeze(-1)
 
             i = pa.table({"id": q.numpy()})  # noqa
 
@@ -142,8 +138,6 @@ class Dataset(msgspec.Struct, frozen=True):
                   FROM {name} POSITIONAL JOIN i 
                 """
             )
-
-        return self
 
     def search(
         self,
@@ -166,10 +160,13 @@ class Dataset(msgspec.Struct, frozen=True):
                 np.stack(query[q["conf"]["column"]].to_numpy(zero_copy_only=False)),
             )
 
-            i = vq.apply_quantization(x, q["data"], metric=q["conf"]["metric"])
-            i = vq.index_quantization(i, k=q["conf"]["k"])
+            d = vq.apply_quantization(x, q["data"], metric=q["conf"]["metric"])
+            i = vq.index_quantization(d, k=params["probes"])
 
-            query = query.append_column("group_id", pa.array(i.numpy()))
+            query = query.append_column("group_id", pa.array(list(i.numpy())))
+            query = duckdb.sql(
+                "SELECT * EXCLUDE(group_id), UNNEST(group_id) AS group_id FROM query"
+            ).to_arrow_table()
 
             params["metric"] = q["conf"]["metric"]
             params["column"] = q["conf"]["column"]
