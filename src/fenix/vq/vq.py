@@ -11,7 +11,7 @@ def distance(u: Tensor, v: Tensor, metric: str = "l2") -> Tensor:
         u = F.normalize(u, dim=-1)
         v = F.normalize(v, dim=-1)
         d = u @ v.transpose(-1, -2)
-        d = 0.5 * (1 + d)
+        d = 0.5 - 0.5 * d
 
     if metric == "dot":
         d = -u @ v.transpose(-1, -2)
@@ -27,8 +27,6 @@ def build_quantization(
     metric: str = "l2",
     epochs: int = 50,
 ) -> Tensor:
-    x = x.dequantize()
-
     i = torch.randperm(x.size(0))[:k]
     q = x[i]
 
@@ -41,18 +39,18 @@ def build_quantization(
             v = F.normalize(v, dim=-1)
 
         d = distance(v, q, metric=metric)
-
         i = torch.argmin(d, dim=-1)
-        q = torch.index_put_(q, (i,), v, accumulate=True)
+
+        q = torch.scatter_reduce(
+            q,
+            dim=0,
+            index=i.unsqueeze(-1).repeat_interleave(x.size(-1), dim=-1),
+            src=v,
+            reduce="mean",
+        )
 
         if metric == "cosine":
             q = F.normalize(q, dim=-1)
-
-        else:
-            c = i[None, :] == torch.arange(k)[:, None]
-            c = torch.sum(c, dim=-1, keepdim=True) + 1
-
-            q = q / c
 
     q = torch.unsqueeze(q, dim=0)
 
@@ -68,27 +66,12 @@ def build_quantization(
     return q
 
 
-def apply_quantization(x: Tensor, q: Tensor, metric: str = "l2") -> Tensor:
-    x = x.dequantize()
-    q = q.dequantize()
+def apply_quantization(x: Tensor, q: Tensor, k: int, metric: str = "l2") -> Tensor:
     n = q.size(0)
-
-    d = distance(x, q[0], metric=metric).unsqueeze(0)
-
-    if n > 1:
-        d = torch.concatenate(
-            [
-                d,
-                apply_quantization(x, q[1:], metric=metric),
-            ],
-            dim=0,
-        )
-
-    return d
-
-
-def index_quantization(d: Tensor, k: int, metric: str = "l2") -> Tensor:
-    n = d.size(0)
+    d = torch.stack(
+        [distance(x, q[i], metric=metric) for i in range(n)],
+        dim=0,
+    )
 
     dim = (n - 1) * [None]
     s = d[0, ..., *dim]
@@ -100,7 +83,7 @@ def index_quantization(d: Tensor, k: int, metric: str = "l2") -> Tensor:
         s = s + d[i, :, *l, :, *r]
 
     return torch.topk(
-        torch.flatten(s, start_dim=1),
+        s.flatten(1),
         k=k,
         dim=-1,
         largest=False,
