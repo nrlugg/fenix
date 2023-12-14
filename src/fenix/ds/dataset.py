@@ -17,9 +17,9 @@ class IndexConfig(TypedDict):
     n: int
     f: int
     column: str
-    metric: str
-    sample: int
+    metrix: str
     epochs: int
+    sample: int
 
 
 class SearchSelect(TypedDict):
@@ -39,7 +39,7 @@ class SearchParams(TypedDict, total=False):
 def default_search_params() -> SearchParams:
     return {
         "limit": 10,
-        "probes": 1,
+        "probes": 32,
         "filter": None,
         "select": None,
         "column": "vector",
@@ -96,6 +96,11 @@ class Dataset(msgspec.Struct, frozen=True):
             return conn.table(name).record_batch(batch_size)
 
     def create_index(self, name: str, conf: IndexConfig) -> None:
+        path = join(self.indexes_uri, f"{name}.pt")
+
+        if os.path.exists(path):
+            raise FileExistsError()
+
         with self.connect() as conn:
             t = conn.sql(
                 f"SELECT * FROM {name} USING SAMPLE {conf['sample']} ROWS"
@@ -112,7 +117,6 @@ class Dataset(msgspec.Struct, frozen=True):
                 k=conf["k"],
                 n=conf["n"],
                 f=conf["f"],
-                metric=conf["metric"],
                 epochs=conf["epochs"],
             )
 
@@ -121,11 +125,10 @@ class Dataset(msgspec.Struct, frozen=True):
                     "conf": conf,
                     "data": q,
                 },
-                join(self.indexes_uri, f"{name}.pt"),
+                path,
             )
 
-            q = vq.apply_quantization(x, q, metric=conf["metric"])
-            q = vq.index_quantization(q, k=1).squeeze(-1)
+            q = vq.apply_quantization(x, q, 1).squeeze(-1)
 
             i = pa.table({"id": q.numpy()})  # noqa
 
@@ -138,6 +141,15 @@ class Dataset(msgspec.Struct, frozen=True):
                   FROM {name} POSITIONAL JOIN i 
                 """
             )
+
+    def remove_index(self, name: str) -> None:
+        path = join(self.indexes_uri, f"{name}.pt")
+        if os.path.exists(path):
+            os.unlink(path)
+
+        with self.connect() as conn:
+            if "group_id" in conn.table(name).columns:
+                conn.sql(f"ALTER TABLE {name} DROP group_id")
 
     def search(
         self,
@@ -160,8 +172,7 @@ class Dataset(msgspec.Struct, frozen=True):
                 np.stack(query[q["conf"]["column"]].to_numpy(zero_copy_only=False)),
             )
 
-            d = vq.apply_quantization(x, q["data"], metric=q["conf"]["metric"])
-            i = vq.index_quantization(d, k=params["probes"])
+            i = vq.apply_quantization(x, q["data"], params["probes"])
 
             query = query.append_column("group_id", pa.array(list(i.numpy())))
             query = duckdb.sql(
@@ -180,12 +191,14 @@ class Dataset(msgspec.Struct, frozen=True):
         )
 
         func = (
-            "0.5 + 0.5 * list_cosine_similarity"
+            "1 - list_cosine_similarity"
             if params["metric"] == "cosine"
             else "-list_inner_product"
             if params["metric"] == "dot"
             else "list_distance"
         )
+
+        print(func)
 
         self.create_table(QUERY, query)
 
@@ -202,6 +215,8 @@ class Dataset(msgspec.Struct, frozen=True):
                 ],
                 "distance",
             ]
+
+            print(select)
 
             data = (
                 conn.sql(
