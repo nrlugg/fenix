@@ -4,16 +4,15 @@ from typing import Iterator
 import msgspec
 import pyarrow as pa
 import pyarrow.flight as fl
+from torch import Tensor
 
-from fenix.ds.config import Config, default_config
-from fenix.ds.dataset import Dataset
-from fenix.ds.engine import Engine
+from fenix.ds.dataset import Dataset, IndexConfig, SearchParams
 
 
 class FlightServer(fl.FlightServerBase):
     def __init__(
         self,
-        database: str = "./data/fenix.ddb",
+        database: str,
         location: str | None = None,
     ) -> None:
         super().__init__(location=location)
@@ -27,7 +26,7 @@ class FlightServer(fl.FlightServerBase):
         descriptor: fl.FlightDescriptor,
     ) -> fl.FlightInfo:
         name = descriptor.path[0].decode()
-        data = self.dataset.get(name)
+        data = self.dataset.table(name)
 
         return fl.FlightInfo(
             schema=data.schema,
@@ -55,14 +54,16 @@ class FlightServer(fl.FlightServerBase):
         reader: fl.MetadataRecordBatchReader,
         writer: fl.FlightMetadataWriter,
     ) -> None:
-        self.dataset.put(
-            descriptor.path[0].decode(),
-            reader.read_all(),
-        )
+        name = descriptor.path[0].decode()
+
+        if name in self.dataset.list_tables():
+            self.dataset.update_table(name, reader.read_all())
+        else:
+            self.dataset.create_table(name, reader.read_all())
 
     def do_get(self, ctx: fl.ServerCallContext, ticket: fl.Ticket):
         name = ticket.ticket.decode()
-        data = self.dataset.get(name)
+        data = self.dataset.table(name)
 
         return fl.GeneratorStream(data.schema, data)
 
@@ -73,74 +74,132 @@ class FlightServer(fl.FlightServerBase):
         reader: fl.MetadataRecordBatchReader,
         writer: fl.MetadataRecordBatchWriter,
     ) -> None:
+        body = msgspec.json.decode(descriptor.command)
         data = self.dataset.search(
-            query=reader.read_all(),
-            index=descriptor.path[0].decode(),
-            config=msgspec.json.decode(descriptor.path[1]),
+            target=reader.read_all(),
+            source=body["source"],
+            params=body["params"],
         )
 
         writer.begin(data.schema)
         writer.write_table(data)
 
     def do_action(self, ctx: fl.ServerCallContext, action: fl.Action) -> None:
-        if action.type == "drop":
-            self.dataset.drop(
-                action.body.to_pybytes().decode(),
-            )
+        body = msgspec.json.decode(action.body.to_pybytes())
+
+        match action.type:
+            case "remove-table":
+                self.dataset.remove_table(**body)
+
+            case "create-index":
+                self.dataset.create_index(**body)
+
+            case "remove-index":
+                self.dataset.remove_index(**body)
+
+            case "update-index":
+                self.dataset.remove_index(**body)
+
+            case _:
+                raise NotImplementedError()
 
 
-class FlightDataset(Engine, frozen=True, dict=True):
+class FlightDataset(msgspec.Struct, frozen=True, dict=True):
     uri: str
 
     @functools.cached_property
-    def client(self) -> fl.FlightClient:
+    def connect(self) -> fl.FlightClient:
         return fl.connect(self.uri)
 
     def list_tables(self) -> list[str]:
         return [
-            flight.endpoints[0].ticket.ticket.decode() for flight in self.client.list_flights()
+            flight.endpoints[0].ticket.ticket.decode() for flight in self.connect.list_flights()
         ]
 
-    def put(self, name: str, data: pa.RecordBatchReader) -> "FlightDataset":
+    def _insert_data(self, name: str, data: pa.Table | pa.RecordBatchReader) -> None:
+        data = data if isinstance(data, pa.RecordBatchReader) else data.to_reader()
+
         descriptor = fl.FlightDescriptor.for_path(name)
-        writer, reader = self.client.do_put(descriptor, data.schema)
+        writer, reader = self.connect.do_put(descriptor, data.schema)
 
         for batch in data:
             writer.write_batch(batch)
 
         writer.close()
 
-        return self
+    def create_table(self, name: str, data: pa.Table | pa.RecordBatchReader) -> None:
+        assert name not in self.list_tables()
+        self._insert_data(name, data)
 
-    def get(self, name: str) -> pa.RecordBatchReader:
-        flight = self.client.get_flight_info(fl.FlightDescriptor.for_path(name))
-        ticket = flight.endpoints[0].ticket
-        reader = self.client.do_get(ticket)
-        return reader.to_reader()
+    def update_table(self, name: str, data: pa.Table | pa.RecordBatchReader) -> None:
+        assert name in self.list_tables()
+        self._insert_data(name, data)
 
-    def drop(self, name: str) -> "FlightDataset":
-        self.client.do_action(
-            fl.Action("drop", name.encode()),
+    def remove_table(self, name: str) -> None:
+        assert name in self.list_tables()
+        self.connect.do_action(
+            fl.Action(
+                "remove-table",
+                msgspec.json.encode({"name": name}),
+            )
         )
 
-        return self
+    def create_index(self, name: str, conf: IndexConfig) -> None:
+        assert name in self.list_tables()
+        self.connect.do_action(
+            fl.Action(
+                "create-index",
+                msgspec.json.encode({"name": name, "conf": conf}),
+            )
+        )
+
+    def update_index(self, name: str, conf: IndexConfig) -> None:
+        assert name in self.list_tables()
+        self.connect.do_action(
+            fl.Action(
+                "update-index",
+                msgspec.json.encode({"name": name, "conf": conf}),
+            )
+        )
+
+    def remove_index(self, name: str) -> None:
+        assert name in self.list_tables()
+        self.connect.do_action(
+            fl.Action(
+                "remove-index",
+                msgspec.json.encode({"name": name}),
+            )
+        )
+
+    def table(self, name: str) -> pa.RecordBatchReader:
+        flight = self.connect.get_flight_info(fl.FlightDescriptor.for_path(name))
+        ticket = flight.endpoints[0].ticket
+        reader = self.connect.do_get(ticket)
+        return reader.to_reader()
+
+    def index(self, name: str) -> Tensor:
+        raise NotImplementedError()
 
     def search(
         self,
-        query: pa.Table,
-        index: str,
-        config: Config | None = None,
+        target: pa.Table,
+        source: str,
+        params: SearchParams | None = None,
     ) -> pa.Table:
-        descriptor = fl.FlightDescriptor.for_path(
-            index,
-            msgspec.json.encode(config if config else default_config()),
+        descriptor = fl.FlightDescriptor.for_command(
+            msgspec.json.encode(
+                {
+                    "source": source,
+                    "params": params,
+                }
+            )
         )
 
-        writer, reader = self.client.do_exchange(descriptor)
+        writer, reader = self.connect.do_exchange(descriptor)
 
         with writer:
-            writer.begin(query.schema)
-            writer.write_table(query)
+            writer.begin(target.schema)
+            writer.write_table(target)
             writer.done_writing()
 
             result = reader.read_all()

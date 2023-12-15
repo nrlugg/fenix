@@ -8,6 +8,7 @@ import numpy as np
 import pyarrow as pa
 import torch
 import xxhash
+from torch import Tensor
 
 import fenix.vq as vq
 
@@ -17,14 +18,19 @@ class IndexConfig(TypedDict):
     n: int
     f: int
     column: str
-    metrix: str
+    metric: str
     epochs: int
     sample: int
 
 
-class SearchSelect(TypedDict):
-    query: list[str]
-    table: list[str]
+class SavedIndex(TypedDict):
+    data: Tensor
+    conf: IndexConfig
+
+
+class SearchSelect(TypedDict, total=False):
+    target: list[str]
+    source: list[str]
 
 
 class SearchParams(TypedDict, total=False):
@@ -33,7 +39,7 @@ class SearchParams(TypedDict, total=False):
     filter: str | None
     select: SearchSelect | None
     column: str
-    metric: str
+    metric: str | None
 
 
 def default_search_params() -> SearchParams:
@@ -43,12 +49,12 @@ def default_search_params() -> SearchParams:
         "filter": None,
         "select": None,
         "column": "vector",
-        "metric": "index",
+        "metric": None,
     }
 
 
 class Dataset(msgspec.Struct, frozen=True):
-    uri: str = "./data/random"
+    uri: str
 
     def __post_init__(self) -> None:
         os.makedirs(self.indexes_uri, exist_ok=True)
@@ -70,19 +76,35 @@ class Dataset(msgspec.Struct, frozen=True):
         with self.connect(read_only=True) as conn:
             return [name for (name,) in conn.execute("SHOW TABLES").fetchall()]
 
-    def create_table(self, name: str, data: pa.Table) -> None:
+    def create_table(self, name: str, data: pa.Table | pa.RecordBatchReader) -> None:
         assert name not in self.list_tables()
 
         with self.connect() as conn:
-            table = conn.from_arrow(data)
-            table.create(name)
+            if isinstance(data, pa.Table):
+                table = conn.from_arrow(data)
+                table.create(name)
 
-    def update_table(self, name: str, data: pa.Table) -> None:
+            elif isinstance(data, pa.RecordBatchReader):
+                batch = conn.from_arrow(data.read_next_batch())
+                batch.create(name)
+
+                for batch in map(conn.from_arrow, data):
+                    batch.insert_into(name)
+
+            else:
+                raise ValueError()
+
+    def update_table(self, name: str, data: pa.Table | pa.RecordBatchReader) -> None:
         assert name in self.list_tables()
 
         with self.connect() as conn:
-            table = conn.from_arrow(data)
-            table.insert_into(name)
+            if isinstance(data, pa.Table):
+                table = conn.from_arrow(data)
+                table.insert_into(name)
+
+            elif isinstance(data, pa.RecordBatchReader):
+                for batch in map(conn.from_arrow, data):
+                    batch.insert_into(name)
 
     def remove_table(self, name: str) -> None:
         if name not in self.list_tables():
@@ -91,9 +113,7 @@ class Dataset(msgspec.Struct, frozen=True):
         with self.connect() as conn:
             conn.sql(f"DROP TABLE IF EXISTS {name}")
 
-    def to_pyarrow(self, name: str, batch_size: int = 32_000) -> pa.RecordBatchReader:
-        with duckdb.connect(self.uri, read_only=True) as conn:
-            return conn.table(name).record_batch(batch_size)
+        self.remove_index(name)
 
     def create_index(self, name: str, conf: IndexConfig) -> None:
         path = join(self.indexes_uri, f"{name}.pt")
@@ -142,6 +162,10 @@ class Dataset(msgspec.Struct, frozen=True):
                 """
             )
 
+    def update_index(self, name: str, conf: IndexConfig) -> None:
+        self.remove_index(name)
+        self.create_index(name, conf)
+
     def remove_index(self, name: str) -> None:
         path = join(self.indexes_uri, f"{name}.pt")
         if os.path.exists(path):
@@ -151,43 +175,50 @@ class Dataset(msgspec.Struct, frozen=True):
             if "group_id" in conn.table(name).columns:
                 conn.sql(f"ALTER TABLE {name} DROP group_id")
 
+    def table(self, name: str, batch_size: int = 32_000) -> pa.RecordBatchReader:
+        with duckdb.connect(self.dataset_uri, read_only=True) as conn:
+            return conn.table(name).record_batch(batch_size)
+
+    def index(self, name: str) -> SavedIndex:
+        return torch.load(
+            join(self.indexes_uri, f"{name}.pt"),
+            map_location="cpu",
+        )
+
     def search(
         self,
-        table: str,
-        query: pa.Table,
+        target: pa.Table,
+        source: str,
         params: SearchParams | None = None,
     ) -> pa.Table:
         params = default_search_params() | params if params else default_search_params()
 
-        QUERY = xxhash.xxh64(msgspec.msgpack.encode(params)).hexdigest()
-        QUERY = f"query_{table}_{QUERY}"
+        SOURCE = source
+        TARGET = xxhash.xxh64(msgspec.msgpack.encode(params)).hexdigest()
+        TARGET = f"target_{SOURCE}_{TARGET}"
 
-        query = query.select(params["select"]["query"]) if params["select"] is not None else query
-
-        if params["metric"] == "index":
-            index_uri = join(self.indexes_uri, f"{table}.pt")
-            assert os.path.exists(index_uri)
-            q = torch.load(index_uri, map_location="cpu")
+        if params["metric"] is None:
+            q = self.index(SOURCE)
             x = torch.from_numpy(
-                np.stack(query[q["conf"]["column"]].to_numpy(zero_copy_only=False)),
+                np.stack(target[q["conf"]["column"]].to_numpy(zero_copy_only=False)),
             )
 
             i = vq.apply_quantization(x, q["data"], params["probes"])
 
-            query = query.append_column("group_id", pa.array(list(i.numpy())))
-            query = duckdb.sql(
-                "SELECT * EXCLUDE(group_id), UNNEST(group_id) AS group_id FROM query"
+            target = target.append_column("group_id", pa.array(list(i.numpy())))
+            target = duckdb.sql(
+                "SELECT * EXCLUDE(group_id), UNNEST(group_id) AS group_id FROM target"
             ).to_arrow_table()
 
             params["metric"] = q["conf"]["metric"]
             params["column"] = q["conf"]["column"]
-            filter = f"{QUERY}.group_id = {table}.group_id"
+            filter = f"{TARGET}.group_id = {SOURCE}.group_id"
             params["filter"] = (
                 filter if params["filter"] is None else " AND ".join([filter, params["filter"]])
             )
 
-        query = query.rename_columns(
-            [f"query_{name}" if name != "group_id" else name for name in query.column_names]
+        target = target.rename_columns(
+            [f"target.{name}" if name != "group_id" else name for name in target.column_names]
         )
 
         func = (
@@ -198,42 +229,48 @@ class Dataset(msgspec.Struct, frozen=True):
             else "list_distance"
         )
 
-        print(func)
-
-        self.create_table(QUERY, query)
+        self.create_table(TARGET, target)
 
         with self.connect(read_only=True) as conn:
             limit = params["limit"]
             column = params["column"]
             filter = f"{params['filter']}" if params["filter"] else ""
             select = [
-                *[name for name in conn.table(QUERY).columns if name != "group_id"],
                 *[
-                    f"{name} AS index_{name}" if name != "group_id" else name
-                    for name in conn.table(table).columns
-                    if params["select"] is None or name in params["select"]["table"]
+                    f'"{name}"'
+                    for name in conn.table(TARGET).columns
+                    if name != "group_id"
+                    and (
+                        params["select"] is None
+                        or name.removeprefix("target.") in params["select"]["target"]
+                    )
                 ],
-                "distance",
+                *[
+                    f'"{name}" AS "source.{name}"'
+                    for name in conn.table(SOURCE).columns
+                    if name != "group_id"
+                    and (params["select"] is None or name in params["select"]["source"])
+                ],
+                "group_id AS _group_id",
+                "distance AS _distance",
             ]
-
-            print(select)
 
             data = (
                 conn.sql(
                     f"""
                     SELECT
-                      {QUERY}.*
-                    , {table}.*
-                    , {func}({QUERY}.query_{column}, {table}.{column}) AS distance
-                    FROM {QUERY} INNER JOIN {table} ON {filter}
-                    QUALIFY ROW_NUMBER() OVER(PARTITION BY {QUERY}.query_id ORDER BY distance ASC) <= {limit}
-                    ORDER BY {QUERY}.query_id ASC, distance ASC
+                      {TARGET}.*
+                    , {SOURCE}.*
+                    , {func}({TARGET}."target.{column}", {SOURCE}.{column}) AS distance
+                    FROM {TARGET} INNER JOIN {SOURCE} ON {filter}
+                    QUALIFY ROW_NUMBER() OVER(PARTITION BY {TARGET}."target.id" ORDER BY distance ASC) <= {limit}
+                    ORDER BY {TARGET}."target.id" ASC, distance ASC
                     """
                 )
                 .project(", ".join(select))
                 .to_arrow_table()
             )
 
-        self.remove_table(QUERY)
+        self.remove_table(TARGET)
 
         return data
