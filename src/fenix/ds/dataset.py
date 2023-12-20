@@ -241,10 +241,6 @@ class Dataset(msgspec.Struct, frozen=True, dict=True):
         column: str,
         metric: str,
     ) -> pa.Table:
-        x = torch.from_numpy(
-            np.stack(query[column].to_numpy(zero_copy_only=False)),
-        )
-
         q = self.client.read_in_memory(query).rename(
             lambda name: f"query.{name}" if name != GROUP_ID_COLUMN else name
         )
