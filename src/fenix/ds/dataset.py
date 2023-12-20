@@ -229,7 +229,7 @@ class Dataset(msgspec.Struct, frozen=True, dict=True):
             )
             .filter(col["rank"] <= limit)
             .drop("rank")
-            .order_by(["query.id", "__DISTANCE__"])
+            .order_by(["query.id", DISTANCE_COLUMN])
             .to_pyarrow()
         )
 
