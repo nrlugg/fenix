@@ -6,7 +6,7 @@ import pyarrow as pa
 import pyarrow.flight as fl
 from torch import Tensor
 
-from fenix.ds.dataset import Dataset, IndexConfig, SearchParams
+from fenix.ds.dataset import Dataset, IndexConfig
 
 
 class FlightServer(fl.FlightServerBase):
@@ -75,11 +75,23 @@ class FlightServer(fl.FlightServerBase):
         writer: fl.MetadataRecordBatchWriter,
     ) -> None:
         body = msgspec.json.decode(descriptor.command)
-        data = self.dataset.search(
-            target=reader.read_all(),
-            source=body["source"],
-            params=body["params"],
-        )
+
+        if body["search"]["type"] == "index":
+            data = self.dataset.search_index(
+                table=body["table"],
+                query=reader.read_all(),
+                **body["search"]["args"],
+            )
+
+        elif body["search"]["type"] == "table":
+            data = self.dataset.search_table(
+                table=body["table"],
+                query=reader.read_all(),
+                **body["search"]["args"],
+            )
+
+        else:
+            raise ValueError()
 
         writer.begin(data.schema)
         writer.write_table(data)
@@ -101,7 +113,7 @@ class FlightServer(fl.FlightServerBase):
                 self.dataset.remove_index(**body)
 
             case _:
-                raise NotImplementedError()
+                raise ValueError()
 
 
 class FlightDataset(msgspec.Struct, frozen=True, dict=True):
@@ -180,17 +192,24 @@ class FlightDataset(msgspec.Struct, frozen=True, dict=True):
     def index(self, name: str) -> Tensor:
         raise NotImplementedError()
 
-    def search(
+    def search_index(
         self,
-        target: pa.Table,
-        source: str,
-        params: SearchParams | None = None,
+        table: str,
+        query: pa.Table,
+        limit: int,
+        probes: int,
     ) -> pa.Table:
         descriptor = fl.FlightDescriptor.for_command(
             msgspec.json.encode(
                 {
-                    "source": source,
-                    "params": params,
+                    "table": table,
+                    "search": {
+                        "type": "index",
+                        "conf": {
+                            "limit": limit,
+                            "probes": probes,
+                        },
+                    },
                 }
             )
         )
@@ -198,10 +217,41 @@ class FlightDataset(msgspec.Struct, frozen=True, dict=True):
         writer, reader = self.connect.do_exchange(descriptor)
 
         with writer:
-            writer.begin(target.schema)
-            writer.write_table(target)
+            writer.begin(query.schema)
+            writer.write_table(query)
             writer.done_writing()
 
-            result = reader.read_all()
+            return reader.read_all()
 
-        return result
+    def search_table(
+        self,
+        table: str,
+        query: pa.Table,
+        limit: int,
+        column: str,
+        metric: str,
+    ) -> pa.Table:
+        descriptor = fl.FlightDescriptor.for_command(
+            msgspec.json.encode(
+                {
+                    "table": table,
+                    "search": {
+                        "type": "table",
+                        "conf": {
+                            "limit": limit,
+                            "column": column,
+                            "metric": metric,
+                        },
+                    },
+                }
+            )
+        )
+
+        writer, reader = self.connect.do_exchange(descriptor)
+
+        with writer:
+            writer.begin(query.schema)
+            writer.write_table(query)
+            writer.done_writing()
+
+            return reader.read_all()
