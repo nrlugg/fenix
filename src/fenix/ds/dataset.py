@@ -1,280 +1,339 @@
-import functools
 import os
-from os.path import join
-from typing import TypedDict
+from typing import TypedDict, TypeVar
 
-import ibis
+import duckdb
 import msgspec
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import torch
-from ibis import deferred as col
-from ibis import selectors as sel
-from ibis import udf
 from torch import Tensor
 
 import fenix.vq as vq
 
+TABLE_NAME: str = "dataset"
+INDEX_NAME: str = "hashing"
+QUERY_NAME: str = "query"
+VECTOR_COLUMN: str = "vector"
 DISTANCE_COLUMN: str = "__DISTANCE__"
 GROUP_ID_COLUMN: str = "__GROUP_ID__"
-TABLE_ID_COLUMN: str = "id"
 
 
-class IndexConfig(TypedDict):
+Array = TypeVar("Array", pa.Array, np.ndarray, Tensor)
+
+
+class HashingConfig(TypedDict, total=False):
     k: int
     n: int
     f: int
-    column: str
     metric: str
     epochs: int
-    sample: int
 
 
-class SavedIndex(TypedDict):
-    data: Tensor
-    conf: IndexConfig
+def default_hashing_config() -> HashingConfig:
+    return dict(
+        k=256,
+        n=2,
+        f=256,
+        metric="cosine",
+        epochs=50,
+    )
 
 
-@udf.scalar.builtin
-def list_inner_product(u: list[float], v: list[float]) -> float:  # type:ignore
-    ...
+class Hashing(msgspec.Struct, frozen=True, dict=True):
+    q: Tensor
+    k: int
+    n: int
+    f: int
+    metric: str
+    epochs: int
 
+    @staticmethod
+    def from_array(x: pa.Array | np.ndarray | Tensor, config: HashingConfig) -> "Hashing":
+        config = default_hashing_config() | config
 
-@udf.scalar.builtin
-def list_distance(u: list[float], v: list[float]) -> float:  # type:ignore
-    ...
+        if isinstance(x, pa.Array):
+            x = np.stack(x.to_numpy(zero_copy_only=False))
 
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x)
 
-@udf.scalar.builtin
-def list_cosine_similarity(u: list[float], v: list[float]) -> float:  # type:ignore
-    ...
+        return Hashing(vq.build_quantization(x, **config), **config)
+
+    @staticmethod
+    def from_table(t: pa.Table, config: HashingConfig) -> "Hashing":
+        return Hashing.from_array(t[VECTOR_COLUMN].combine_chunks(), config=config)
+
+    @staticmethod
+    def from_connection(c: duckdb.DuckDBPyConnection) -> "Hashing":
+        t = c.table(INDEX_NAME).fetch_arrow_table()
+
+        q = torch.sparse_coo_tensor(
+            torch.from_numpy(np.stack([t["n"].to_numpy(), t["k"].to_numpy()])),
+            torch.from_numpy(np.stack(t["q"].to_numpy())),
+        ).to_dense()
+
+        k = pc.max(t["k"]).as_py() + 1
+        n = pc.max(t["n"]).as_py() + 1
+        [f] = t["f"].unique().to_pylist()
+        [metric] = t["metric"].unique().to_pylist()
+        [epochs] = t["epochs"].unique().to_pylist()
+
+        return Hashing(q, k, n, f, metric, epochs)
+
+    def apply(self, x: Array, k: int) -> Array:
+        if isinstance(x, pa.Array):
+            return pa.array(
+                list(
+                    vq.apply_quantization(
+                        torch.from_numpy(np.stack(x.to_numpy(zero_copy_only=False))),
+                        self.q,
+                        k,
+                        self.metric,
+                    ).numpy()
+                )
+            )
+
+        if isinstance(x, np.ndarray):
+            return vq.apply_quantization(
+                torch.from_numpy(x),
+                self.q,
+                k,
+                self.metric,
+            ).numpy()
+
+        return vq.apply_quantization(torch.from_numpy(x), self.q, k, self.metric)
+
+    def to_table(self) -> pa.Table:
+        q = self.q
+        return pa.Table.from_pylist(
+            [
+                {
+                    "q": q.numpy(),
+                    "n": n,
+                    "k": k,
+                    "f": self.f,
+                    "metric": self.metric,
+                    "epochs": self.epochs,
+                }
+                for n, q in enumerate(q.unbind(0))
+                for k, q in enumerate(q.unbind(0))
+            ],
+        )
 
 
 class Dataset(msgspec.Struct, frozen=True, dict=True):
-    uri: str
+    conn: duckdb.DuckDBPyConnection
 
-    def __post_init__(self) -> None:
-        os.makedirs(self.indexes_uri, exist_ok=True)
+    @staticmethod
+    def from_uri(uri: str) -> "Dataset":
+        os.makedirs(os.path.dirname(uri), exist_ok=True)
+        conn = duckdb.connect(uri)
+        return Dataset(conn)
 
-    @property
-    def dataset_uri(self) -> str:
-        return join(self.uri, "fenix.db")
-
-    @property
-    def indexes_uri(self) -> str:
-        return join(self.uri, "index")
-
-    @functools.cached_property
-    def client(self) -> ibis.BaseBackend:
-        return ibis.duckdb.connect(self.dataset_uri)
-
-    def list_tables(self) -> list[str]:
-        return [name for name in self.client.list_tables() if not name.endswith("-index")]
-
-    def create_table(self, name: str, data: pa.Table | pa.RecordBatchReader) -> None:
-        assert name not in self.list_tables()
-
+    def insert(self, data: pa.Table | pa.RecordBatchReader) -> "Dataset":
         if isinstance(data, pa.Table):
-            self.client.create_table(name, data)
+            return self.insert(data.to_reader())
 
-        elif isinstance(data, pa.RecordBatchReader):
-            batch = self.client.create_table(name, data.read_next_batch())
+        assert isinstance(data, pa.RecordBatchReader)
 
-            for batch in data:
-                self.client.insert(name, batch)
+        for batch in data:
+            batch = pa.Table.from_batches([batch])
+
+            try:
+                count = self.conn.table(TABLE_NAME).count("*").fetch_arrow_table()[0][0].as_py()
+                index = np.arange(count, count + batch.num_rows)
+                batch = batch.add_column(0, "id", pa.array(index))
+
+                group = pa.array([None] * batch.num_rows, type=pa.int64())
+                batch = batch.append_column(GROUP_ID_COLUMN, group)
+
+                self.conn.from_arrow(batch).insert_into(TABLE_NAME)
+
+            except (duckdb.CatalogException, duckdb.InvalidInputException):
+                count = 0
+                index = np.arange(count, count + batch.num_rows)
+                batch = batch.add_column(0, "id", pa.array(index))
+
+                group = pa.array([None] * batch.num_rows, type=pa.int64())
+                batch = batch.append_column(GROUP_ID_COLUMN, group)
+
+                self.conn.from_arrow(batch).create(TABLE_NAME)
+
+        return self.update_index()
+
+    def create_index(self, config: HashingConfig, sample: int | None = None) -> "Dataset":
+        if sample is not None:
+            t = self.conn.sql(
+                f"SELECT {VECTOR_COLUMN} FROM {TABLE_NAME} USING SAMPLE {sample} ROWS"
+            ).fetch_arrow_table()
 
         else:
-            raise ValueError()
+            t = self.conn.table(TABLE_NAME).fetch_arrow_table()
 
-    def update_table(self, name: str, data: pa.Table | pa.RecordBatchReader) -> None:
-        assert name in self.list_tables()
+        h = Hashing.from_table(t, config=config)
 
-        if isinstance(data, pa.Table):
-            self.client.insert(name, data)
+        self.conn.from_arrow(h.to_table()).create(INDEX_NAME)
 
-        elif isinstance(data, pa.RecordBatchReader):
-            for batch in data:
-                self.client.insert(name, batch)
+        return self.update_index()
 
-    def remove_table(self, name: str) -> None:
-        if name not in self.list_tables():
-            return
+    def update_index(self) -> "Dataset":
+        h = self.to_index()
 
-        self.client.drop_table(name)
+        if h is None:
+            return self
 
-    def create_index(self, name: str, conf: IndexConfig) -> None:
-        path = join(self.indexes_uri, f"{name}.bin")
+        def index_hash(v: pa.ListArray) -> pa.Int64Array:
+            return pc.list_element(h.apply(v.combine_chunks(), 1), 0)
 
-        if os.path.exists(path):
-            raise FileExistsError()
-
-        t = self.client.table(name)
-        f = min(conf["sample"] / t.count().execute(), 1.0)
-
-        v = t.sample(f)[conf["column"]].to_pyarrow()
-        x = torch.from_numpy(
-            np.stack(v.to_numpy(zero_copy_only=False)),
+        self.conn.create_function(  # type:ignore
+            "index_hash",
+            index_hash,
+            [duckdb.dtype("FLOAT[]")],
+            duckdb.dtype("BIGINT"),
+            type="arrow",
         )
 
-        q = vq.build_quantization(
-            x,
-            k=conf["k"],
-            n=conf["n"],
-            f=conf["f"],
-            epochs=conf["epochs"],
+        self.conn.sql(
+            f"""
+            UPDATE {TABLE_NAME} AS source SET {GROUP_ID_COLUMN} = (
+                SELECT
+                    COALESCE(target.{GROUP_ID_COLUMN}, index_hash(target.{VECTOR_COLUMN}))
+                FROM
+                    {TABLE_NAME} AS target
+                WHERE
+                    source.id = target.id
+            )
+            """
         )
 
-        torch.save(
-            {
-                "conf": conf,
-                "data": q,
-            },
-            path,
+        def query_hash(v: pa.ListArray, k: pa.Int64Array) -> pa.ListArray:
+            return h.apply(v.combine_chunks(), k[0].as_py())
+
+        self.conn.create_function(  # type:ignore
+            "query_hash",
+            query_hash,
+            [duckdb.dtype("FLOAT[]"), duckdb.dtype("BIGINT")],
+            duckdb.dtype("BIGINT[]"),
+            type="arrow",
         )
 
-        q = vq.apply_quantization(x, q, 1).squeeze(-1)
+        return self
 
-        self.create_table(
-            f"{name}-index",
-            pa.table(
-                {
-                    "table.id": t.id.to_pyarrow(),
-                    GROUP_ID_COLUMN: q.numpy(),
-                }
-            ),
-        )
+    def to_table(self) -> pa.RecordBatchReader:
+        return self.conn.table(TABLE_NAME).fetch_arrow_reader()
 
-    def update_index(self, name: str, conf: IndexConfig) -> None:
-        self.remove_index(name)
-        self.create_index(name, conf)
-
-    def remove_index(self, name: str) -> None:
-        path = join(self.indexes_uri, f"{name}.pt")
-        if os.path.exists(path):
-            os.unlink(path)
-
-        name = f"{name}-index"
-        if name in self.client.list_tables():
-            self.client.drop_table(f"{name}-index")
-
-    def table(self, name: str) -> pa.RecordBatchReader:
-        return self.client.table(name).to_pyarrow_batches()
-
-    def index(self, name: str) -> SavedIndex:
-        return torch.load(
-            join(self.indexes_uri, f"{name}.bin"),
-            map_location="cpu",
-        )
+    def to_index(self) -> Hashing | None:
+        try:
+            return Hashing.from_connection(self.conn)
+        except duckdb.CatalogException:
+            return None
 
     def search_index(
         self,
-        table: str,
         query: pa.Table,
         limit: int,
         probes: int,
     ) -> pa.Table:
-        index = self.index(table)
-        metric = index["conf"]["metric"]
-        column = index["conf"]["column"]
+        query = query.add_column(0, "id", pa.array(np.arange(0, query.num_rows)))
+        query = query.rename_columns([f"target_{c}" for c in query.column_names])
 
-        x = torch.from_numpy(
-            np.stack(query[column].to_numpy(zero_copy_only=False)),
+        h = self.to_index()
+        assert h is not None
+
+        (
+            self.conn.from_arrow(query)
+            .project(
+                duckdb.StarExpression(),  # type:ignore
+                duckdb.FunctionExpression(  # type:ignore
+                    "unnest",
+                    duckdb.FunctionExpression(
+                        "query_hash",
+                        duckdb.ColumnExpression(f"target_{VECTOR_COLUMN}"),
+                        duckdb.ConstantExpression(probes),
+                    ),
+                ).alias(GROUP_ID_COLUMN),
+            )
+            .create(QUERY_NAME)
         )
 
-        i = vq.apply_quantization(x, index["data"], probes, metric)
+        match h.metric:
+            case "cosine":
+                metric = "0.5 - 0.5 * list_cosine_similarity"
+            case "dot":
+                metric = "-list_inner_product"
+            case "l2":
+                metric = "list_distance"
+            case _:
+                raise ValueError()
 
-        q = (
-            self.client.read_in_memory(
-                query.append_column(
-                    GROUP_ID_COLUMN,
-                    pa.array(list(i.numpy()), type=pa.list_(pa.int64())),
-                )
-            )
-            .select(~sel.c(GROUP_ID_COLUMN), col[GROUP_ID_COLUMN].unnest())
-            .rename(lambda name: f"query.{name}" if name != GROUP_ID_COLUMN else name)
-        )
+        r = self.conn.sql(
+            f"""
+            SELECT
+              target.* EXCLUDE(target_{VECTOR_COLUMN}, {GROUP_ID_COLUMN})
+            , source.* EXCLUDE({VECTOR_COLUMN}, {GROUP_ID_COLUMN})
+            , {GROUP_ID_COLUMN}
+            , {metric}(target.target_{VECTOR_COLUMN}, source.{VECTOR_COLUMN}) AS {DISTANCE_COLUMN}
+            FROM {QUERY_NAME} AS target
+                INNER JOIN {TABLE_NAME} AS source USING ({GROUP_ID_COLUMN})
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY target.target_id ORDER BY {DISTANCE_COLUMN}) < {limit}
+            ORDER BY target.target_id, {DISTANCE_COLUMN}
+            """
+        ).fetch_arrow_table()
 
-        t = self.client.table(table).rename(
-            lambda name: f"table.{name}" if name != GROUP_ID_COLUMN else name
-        )
+        self.conn.sql(f"DROP TABLE {QUERY_NAME}")
 
-        u = col[f"query.{column}"]
-        v = col[f"table.{column}"]
-        d = (
-            1 - list_cosine_similarity(u, v)
-            if metric == "cosine"
-            else -list_inner_product(u, v)
-            if metric == "dot"
-            else list_distance(u, v)
-        )
-
-        return (
-            q.inner_join(
-                self.client.table(f"{table}-index"),
-                predicates=GROUP_ID_COLUMN,
-            )
-            .inner_join(t, predicates="table.id")
-            .select(
-                sel.startswith("query.") & ~sel.endswith(f".{column}"),
-                sel.startswith("table.") & ~sel.endswith(f".{column}"),
-                d.name(DISTANCE_COLUMN),
-                GROUP_ID_COLUMN,
-            )
-            .mutate(
-                rank=(
-                    ibis.row_number()
-                    .over(group_by="query.id", order_by=DISTANCE_COLUMN)
-                    .name("rank")
-                )
-            )
-            .filter(col["rank"] <= limit)
-            .drop("rank")
-            .order_by(["query.id", DISTANCE_COLUMN])
-            .to_pyarrow()
+        return r.rename_columns(
+            [
+                f"source_{c}"
+                if not c.startswith("target_") and c not in {GROUP_ID_COLUMN, DISTANCE_COLUMN}
+                else c
+                for c in r.column_names
+            ]
         )
 
     def search_table(
         self,
-        table: str,
         query: pa.Table,
         limit: int,
-        column: str,
         metric: str,
     ) -> pa.Table:
-        q = self.client.read_in_memory(query).rename(
-            lambda name: f"query.{name}" if name != GROUP_ID_COLUMN else name
-        )
+        query = query.add_column(0, "id", pa.array(np.arange(0, query.num_rows)))
+        query = query.rename_columns([f"target_{c}" for c in query.column_names])
 
-        t = self.client.table(table).rename(
-            lambda name: f"table.{name}" if name != GROUP_ID_COLUMN else name
-        )
+        self.conn.from_arrow(query).create(QUERY_NAME)
 
-        u = col[f"query.{column}"]
-        v = col[f"table.{column}"]
-        d = (
-            1 - list_cosine_similarity(u, v)
-            if metric == "cosine"
-            else -list_inner_product(u, v)
-            if metric == "dot"
-            else list_distance(u, v)
-        )
+        match metric:
+            case "cosine":
+                metric = "0.5 - 0.5 * list_cosine_similarity"
+            case "dot":
+                metric = "-list_inner_product"
+            case "l2":
+                metric = "list_distance"
+            case _:
+                raise ValueError()
 
-        return (
-            q.cross_join(t)
-            .select(
-                sel.startswith("query.") & ~sel.endswith(f".{column}"),
-                sel.startswith("table.") & ~sel.endswith(f".{column}"),
-                d.name(DISTANCE_COLUMN),
-            )
-            .mutate(
-                rank=(
-                    ibis.row_number()
-                    .over(group_by="query.id", order_by=DISTANCE_COLUMN)
-                    .name("rank")
-                )
-            )
-            .filter(col["rank"] < limit)
-            .drop("rank")
-            .order_by(["query.id", DISTANCE_COLUMN])
-            .to_pyarrow()
+        r = self.conn.sql(
+            f"""
+            SELECT
+              target.* EXCLUDE(target_{VECTOR_COLUMN})
+            , source.* EXCLUDE({VECTOR_COLUMN})
+            , {metric}(target.target_{VECTOR_COLUMN}, source.{VECTOR_COLUMN}) AS {DISTANCE_COLUMN}
+            FROM
+              {QUERY_NAME} AS target
+            , {TABLE_NAME} AS source
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY target.target_id ORDER BY {DISTANCE_COLUMN}) < {limit}
+            ORDER BY target.target_id, {DISTANCE_COLUMN}
+            """
+        ).fetch_arrow_table()
+
+        self.conn.sql(f"DROP TABLE {QUERY_NAME}")
+
+        return r.rename_columns(
+            [
+                f"source_{c}"
+                if not c.startswith("target_") and c not in {GROUP_ID_COLUMN, DISTANCE_COLUMN}
+                else c
+                for c in r.column_names
+            ]
         )
