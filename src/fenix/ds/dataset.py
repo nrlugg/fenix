@@ -121,15 +121,66 @@ class Hashing(msgspec.Struct, frozen=True, dict=True):
             ],
         )
 
+    def to_index(self, c: duckdb.DuckDBPyConnection) -> "Hashing":
+        c.from_arrow(self.to_table()).create(INDEX_NAME)
+        return self
+
+
+def create_index_hash(h: Hashing, c: duckdb.DuckDBPyConnection) -> None:
+    def index_hash(v: pa.ListArray) -> pa.Int64Array:
+        return pc.list_element(h.apply(v.combine_chunks(), 1), 0)
+
+    c.create_function(  # type:ignore
+        "index_hash",
+        index_hash,
+        [duckdb.dtype("FLOAT[]")],
+        duckdb.dtype("BIGINT"),
+        type="arrow",
+    )
+
+
+def create_query_hash(h: Hashing, c: duckdb.DuckDBPyConnection) -> None:
+    def query_hash(v: pa.ListArray, k: pa.Int64Array) -> pa.ListArray:
+        return h.apply(v.combine_chunks(), k[0].as_py())
+
+    c.create_function(  # type:ignore
+        "query_hash",
+        query_hash,
+        [duckdb.dtype("FLOAT[]"), duckdb.dtype("BIGINT")],
+        duckdb.dtype("BIGINT[]"),
+        type="arrow",
+    )
+
+
+def metric_expression(metric: str) -> str:
+    match metric:
+        case "cosine":
+            return "0.5 - 0.5 * list_cosine_similarity"
+        case "dot":
+            return "-list_inner_product"
+        case "l2":
+            return "list_distance"
+        case _:
+            raise ValueError()
+
 
 class Dataset(msgspec.Struct, frozen=True, dict=True):
     conn: duckdb.DuckDBPyConnection
 
     @staticmethod
-    def from_uri(uri: str) -> "Dataset":
+    def connect(uri: str) -> "Dataset":
         os.makedirs(os.path.dirname(uri), exist_ok=True)
-        conn = duckdb.connect(uri)
-        return Dataset(conn)
+
+        d = Dataset(duckdb.connect(uri))
+
+        if (h := d.to_index()) is not None:
+            create_index_hash(h, d.conn)
+            create_query_hash(h, d.conn)
+
+        return d
+
+    def __del__(self) -> None:
+        self.conn.close()
 
     def insert(self, data: pa.Table | pa.RecordBatchReader) -> "Dataset":
         if isinstance(data, pa.Table):
@@ -163,36 +214,28 @@ class Dataset(msgspec.Struct, frozen=True, dict=True):
         return self.update_index()
 
     def create_index(self, config: HashingConfig, sample: int | None = None) -> "Dataset":
-        if sample is not None:
-            t = self.conn.sql(
-                f"SELECT {VECTOR_COLUMN} FROM {TABLE_NAME} USING SAMPLE {sample} ROWS"
-            ).fetch_arrow_table()
+        if self.to_index() is not None:
+            self.conn.remove_function("index_hash")
+            self.conn.remove_function("query_hash")
+            self.conn.sql(f"DROP TABLE {INDEX_NAME}")
+            self.conn.sql(f"UPDATE {TABLE_NAME} SET {GROUP_ID_COLUMN} = NULL")
 
+        if sample is not None:
+            q = f"SELECT {VECTOR_COLUMN} FROM {TABLE_NAME} USING SAMPLE {sample} ROWS"
+            t = self.conn.sql(q).fetch_arrow_table()
         else:
             t = self.conn.table(TABLE_NAME).fetch_arrow_table()
 
-        h = Hashing.from_table(t, config=config)
+        h = Hashing.from_table(t, config=config).to_index(self.conn)
 
-        self.conn.from_arrow(h.to_table()).create(INDEX_NAME)
+        create_index_hash(h, self.conn)
+        create_query_hash(h, self.conn)
 
         return self.update_index()
 
     def update_index(self) -> "Dataset":
-        h = self.to_index()
-
-        if h is None:
+        if self.to_index() is None:
             return self
-
-        def index_hash(v: pa.ListArray) -> pa.Int64Array:
-            return pc.list_element(h.apply(v.combine_chunks(), 1), 0)
-
-        self.conn.create_function(  # type:ignore
-            "index_hash",
-            index_hash,
-            [duckdb.dtype("FLOAT[]")],
-            duckdb.dtype("BIGINT"),
-            type="arrow",
-        )
 
         self.conn.sql(
             f"""
@@ -205,17 +248,6 @@ class Dataset(msgspec.Struct, frozen=True, dict=True):
                     source.id = target.id
             )
             """
-        )
-
-        def query_hash(v: pa.ListArray, k: pa.Int64Array) -> pa.ListArray:
-            return h.apply(v.combine_chunks(), k[0].as_py())
-
-        self.conn.create_function(  # type:ignore
-            "query_hash",
-            query_hash,
-            [duckdb.dtype("FLOAT[]"), duckdb.dtype("BIGINT")],
-            duckdb.dtype("BIGINT[]"),
-            type="arrow",
         )
 
         return self
@@ -235,11 +267,11 @@ class Dataset(msgspec.Struct, frozen=True, dict=True):
         limit: int,
         probes: int,
     ) -> pa.Table:
-        query = query.add_column(0, "id", pa.array(np.arange(0, query.num_rows)))
-        query = query.rename_columns([f"target_{c}" for c in query.column_names])
-
         h = self.to_index()
         assert h is not None
+
+        query = query.add_column(0, "id", pa.array(np.arange(0, query.num_rows)))
+        query = query.rename_columns([f"target_{c}" for c in query.column_names])
 
         (
             self.conn.from_arrow(query)
@@ -257,15 +289,7 @@ class Dataset(msgspec.Struct, frozen=True, dict=True):
             .create(QUERY_NAME)
         )
 
-        match h.metric:
-            case "cosine":
-                metric = "0.5 - 0.5 * list_cosine_similarity"
-            case "dot":
-                metric = "-list_inner_product"
-            case "l2":
-                metric = "list_distance"
-            case _:
-                raise ValueError()
+        metric = metric_expression(h.metric)
 
         r = self.conn.sql(
             f"""
@@ -303,15 +327,7 @@ class Dataset(msgspec.Struct, frozen=True, dict=True):
 
         self.conn.from_arrow(query).create(QUERY_NAME)
 
-        match metric:
-            case "cosine":
-                metric = "0.5 - 0.5 * list_cosine_similarity"
-            case "dot":
-                metric = "-list_inner_product"
-            case "l2":
-                metric = "list_distance"
-            case _:
-                raise ValueError()
+        metric = metric_expression(metric)
 
         r = self.conn.sql(
             f"""
