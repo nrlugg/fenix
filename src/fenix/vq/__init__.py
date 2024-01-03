@@ -1,1 +1,1 @@
-from .vq import apply_quantization, build_quantization, distance
+from .vq import arrow_to_torch, distance, encode, kmeans
