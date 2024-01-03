@@ -1,355 +1,335 @@
+import functools
 import os
-from typing import TypedDict, TypeVar
+import uuid
+from dataclasses import dataclass
+from os.path import join
+from typing import Iterator, Sequence, TypedDict
 
-import duckdb
-import msgspec
+import fsspec
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.dataset as ds
 import torch
+import xxhash
 from torch import Tensor
 
+import fenix.ex.acero as ac
+import fenix.io as io
 import fenix.vq as vq
 
-TABLE_NAME: str = "dataset"
-INDEX_NAME: str = "hashing"
-QUERY_NAME: str = "query"
-VECTOR_COLUMN: str = "vector"
-DISTANCE_COLUMN: str = "__DISTANCE__"
-GROUP_ID_COLUMN: str = "__GROUP_ID__"
+BATCH_SIZE: int = 2**20
+TABLE_DIR: str = "data"
+INDEX_DIR: str = "indx"
+INDEX_COL: str = "__INDEX__"
+SCORE_COL: str = "__SCORE__"
+
+Select = str | Sequence[str] | None
+Filter = pc.Expression | None
 
 
-Array = TypeVar("Array", pa.Array, np.ndarray, Tensor)
-
-
-class HashingConfig(TypedDict, total=False):
+class IndexConfig(TypedDict):
     k: int
     n: int
-    f: int
     metric: str
-    epochs: int
+    sample_size: int
+    num_samples: int
 
 
-def default_hashing_config() -> HashingConfig:
-    return dict(
-        k=256,
-        n=2,
-        f=256,
-        metric="cosine",
-        epochs=50,
-    )
+class SavedIndex(TypedDict):
+    tensor: Tensor
+    column: str
+    config: IndexConfig
 
 
-class Hashing(msgspec.Struct, frozen=True, dict=True):
-    q: Tensor
-    k: int
-    n: int
-    f: int
-    metric: str
-    epochs: int
-
-    @staticmethod
-    def from_array(x: pa.Array | np.ndarray | Tensor, config: HashingConfig) -> "Hashing":
-        config = default_hashing_config() | config
-
-        if isinstance(x, pa.Array):
-            x = np.stack(x.to_numpy(zero_copy_only=False))
-
-        if isinstance(x, np.ndarray):
-            x = torch.from_numpy(x)
-
-        return Hashing(vq.build_quantization(x, **config), **config)
-
-    @staticmethod
-    def from_table(t: pa.Table, config: HashingConfig) -> "Hashing":
-        return Hashing.from_array(t[VECTOR_COLUMN].combine_chunks(), config=config)
-
-    @staticmethod
-    def from_connection(c: duckdb.DuckDBPyConnection) -> "Hashing":
-        t = c.table(INDEX_NAME).fetch_arrow_table()
-
-        q = torch.sparse_coo_tensor(
-            torch.from_numpy(np.stack([t["n"].to_numpy(), t["k"].to_numpy()])),
-            torch.from_numpy(np.stack(t["q"].to_numpy())),
-        ).to_dense()
-
-        k = pc.max(t["k"]).as_py() + 1
-        n = pc.max(t["n"]).as_py() + 1
-        [f] = t["f"].unique().to_pylist()
-        [metric] = t["metric"].unique().to_pylist()
-        [epochs] = t["epochs"].unique().to_pylist()
-
-        return Hashing(q, k, n, f, metric, epochs)
-
-    def apply(self, x: Array, k: int) -> Array:
-        if isinstance(x, pa.Array):
-            return pa.array(
-                list(
-                    vq.apply_quantization(
-                        torch.from_numpy(np.stack(x.to_numpy(zero_copy_only=False))),
-                        self.q,
-                        k,
-                        self.metric,
-                    ).numpy()
-                )
-            )
-
-        if isinstance(x, np.ndarray):
-            return vq.apply_quantization(
-                torch.from_numpy(x),
-                self.q,
-                k,
-                self.metric,
-            ).numpy()
-
-        return vq.apply_quantization(torch.from_numpy(x), self.q, k, self.metric)
-
-    def to_table(self) -> pa.Table:
-        q = self.q
-        return pa.Table.from_pylist(
-            [
-                {
-                    "q": q.numpy(),
-                    "n": n,
-                    "k": k,
-                    "f": self.f,
-                    "metric": self.metric,
-                    "epochs": self.epochs,
-                }
-                for n, q in enumerate(q.unbind(0))
-                for k, q in enumerate(q.unbind(0))
-            ],
-        )
-
-    def to_index(self, c: duckdb.DuckDBPyConnection) -> "Hashing":
-        c.from_arrow(self.to_table()).create(INDEX_NAME)
-        return self
+def index_field() -> pa.Field:
+    return pc.field(INDEX_COL)
 
 
-def create_index_hash(h: Hashing, c: duckdb.DuckDBPyConnection) -> None:
-    def index_hash(v: pa.ListArray) -> pa.Int64Array:
-        return pc.list_element(h.apply(v.combine_chunks(), 1), 0)
+@dataclass
+class Dataset(ds.Dataset):
+    uri: str
 
-    c.create_function(  # type:ignore
-        "index_hash",
-        index_hash,
-        [duckdb.dtype("FLOAT[]")],
-        duckdb.dtype("BIGINT"),
-        type="arrow",
-    )
+    def __post_init__(self) -> None:
+        self.filesystem.makedirs(self._table_uri(), exist_ok=True)
+        self.filesystem.makedirs(self._index_uri(), exist_ok=True)
 
+        for version, encoder in self.list_indexes().items():
+            self.register_encoder(version, encoder)
+            self.register_distance(encoder["column"], encoder["config"]["metric"])
 
-def create_query_hash(h: Hashing, c: duckdb.DuckDBPyConnection) -> None:
-    def query_hash(v: pa.ListArray, k: pa.Int64Array) -> pa.ListArray:
-        return h.apply(v.combine_chunks(), k[0].as_py())
+    def register_encoder(self, vers: int, data: SavedIndex) -> "Dataset":
+        name = self._index_encoder_name(vers)
+        type = self.schema.field(data["column"]).type
 
-    c.create_function(  # type:ignore
-        "query_hash",
-        query_hash,
-        [duckdb.dtype("FLOAT[]"), duckdb.dtype("BIGINT")],
-        duckdb.dtype("BIGINT[]"),
-        type="arrow",
-    )
-
-
-def metric_expression(metric: str) -> str:
-    match metric:
-        case "cosine":
-            return "0.5 - 0.5 * list_cosine_similarity"
-        case "dot":
-            return "-list_inner_product"
-        case "l2":
-            return "list_distance"
-        case _:
-            raise ValueError()
-
-
-class Dataset(msgspec.Struct, frozen=True, dict=True):
-    conn: duckdb.DuckDBPyConnection
-
-    @staticmethod
-    def connect(uri: str) -> "Dataset":
-        os.makedirs(os.path.dirname(uri), exist_ok=True)
-
-        d = Dataset(duckdb.connect(uri))
-
-        if (h := d.to_index()) is not None:
-            create_index_hash(h, d.conn)
-            create_query_hash(h, d.conn)
-
-        return d
-
-    def __del__(self) -> None:
-        self.conn.close()
-
-    def insert(self, data: pa.Table | pa.RecordBatchReader) -> "Dataset":
-        if isinstance(data, pa.Table):
-            return self.insert(data.to_reader())
-
-        assert isinstance(data, pa.RecordBatchReader)
-
-        for batch in data:
-            batch = pa.Table.from_batches([batch])
-
-            try:
-                count = self.conn.table(TABLE_NAME).count("*").fetch_arrow_table()[0][0].as_py()
-                index = np.arange(count, count + batch.num_rows)
-                batch = batch.add_column(0, "id", pa.array(index))
-
-                group = pa.array([None] * batch.num_rows, type=pa.int64())
-                batch = batch.append_column(GROUP_ID_COLUMN, group)
-
-                self.conn.from_arrow(batch).insert_into(TABLE_NAME)
-
-            except (duckdb.CatalogException, duckdb.InvalidInputException):
-                count = 0
-                index = np.arange(count, count + batch.num_rows)
-                batch = batch.add_column(0, "id", pa.array(index))
-
-                group = pa.array([None] * batch.num_rows, type=pa.int64())
-                batch = batch.append_column(GROUP_ID_COLUMN, group)
-
-                self.conn.from_arrow(batch).create(TABLE_NAME)
-
-        return self.update_index()
-
-    def create_index(self, config: HashingConfig, sample: int | None = None) -> "Dataset":
-        if self.to_index() is not None:
-            self.conn.remove_function("index_hash")
-            self.conn.remove_function("query_hash")
-            self.conn.sql(f"DROP TABLE {INDEX_NAME}")
-            self.conn.sql(f"UPDATE {TABLE_NAME} SET {GROUP_ID_COLUMN} = NULL")
-
-        if sample is not None:
-            q = f"SELECT {VECTOR_COLUMN} FROM {TABLE_NAME} USING SAMPLE {sample} ROWS"
-            t = self.conn.sql(q).fetch_arrow_table()
-        else:
-            t = self.conn.table(TABLE_NAME).fetch_arrow_table()
-
-        h = Hashing.from_table(t, config=config).to_index(self.conn)
-
-        create_index_hash(h, self.conn)
-        create_query_hash(h, self.conn)
-
-        return self.update_index()
-
-    def update_index(self) -> "Dataset":
-        if self.to_index() is None:
+        if name in pc.list_functions():
             return self
 
-        self.conn.sql(
-            f"""
-            UPDATE {TABLE_NAME} AS source SET {GROUP_ID_COLUMN} = (
-                SELECT
-                    COALESCE(target.{GROUP_ID_COLUMN}, index_hash(target.{VECTOR_COLUMN}))
-                FROM
-                    {TABLE_NAME} AS target
-                WHERE
-                    source.id = target.id
-            )
-            """
+        def func(
+            ctx: pc.UdfContext, v: pa.FixedShapeTensorArray, k: pa.Int64Scalar
+        ) -> pa.ListArray:
+            x = vq.arrow_to_torch(v)
+            i = vq.encode(x, data["tensor"], k.as_py(), data["config"]["metric"])
+            return pa.array(iter(i.numpy()))
+
+        pc.register_scalar_function(
+            func,
+            name,
+            {"summary": "", "description": ""},
+            {"v": type, "k": pa.int64()},
+            pa.list_(pa.int64()),
         )
 
         return self
 
-    def to_table(self) -> pa.RecordBatchReader:
-        return self.conn.table(TABLE_NAME).fetch_arrow_reader()
+    def register_distance(self, column: str, metric: str) -> "Dataset":
+        type = self.schema.field(column).type
+        size = type.shape[0]
+        name = f"list_{metric}_distance:{type.value_type}:{size}"
 
-    def to_index(self) -> Hashing | None:
-        try:
-            return Hashing.from_connection(self.conn)
-        except duckdb.CatalogException:
-            return None
+        def dist(
+            ctx: pc.UdfContext, v: pa.FixedSizeListArray, q: pa.FixedSizeListScalar
+        ) -> pa.FloatArray:
+            return pa.array(
+                vq.distance(
+                    vq.arrow_to_torch(q).unsqueeze(0),
+                    vq.arrow_to_torch(v),
+                    metric=metric,
+                )
+                .squeeze(0)
+                .numpy()
+            )
+
+        pc.register_scalar_function(
+            dist,
+            name,
+            {"summary": "", "description": ""},
+            {"a": type, "b": type.storage_type},
+            type.value_type,
+        )
+
+        return self
+
+    @property
+    def name(self) -> str:
+        return os.path.basename(self.uri)
+
+    @property
+    def hash(self) -> str:
+        return xxhash.xxh32_hexdigest(
+            os.path.abspath(self.uri).encode(),
+        )
+
+    def _table_uri(self, name: str | None = None) -> str:
+        uri = join(self.uri, TABLE_DIR)
+
+        if name is not None:
+            uri = join(uri, name)
+
+        return uri
+
+    def _index_uri(self, vers: int | None = None) -> str:
+        uri = join(self.uri, INDEX_DIR)
+
+        if vers is not None:
+            uri = join(uri, str(vers))
+
+        return uri
+
+    def _index_encoder_name(self, vers: int) -> str:
+        return f"encoder/{self.hash}/{vers}"
+
+    @functools.cached_property
+    def filesystem(self) -> fsspec.AbstractFileSystem:
+        return fsspec.filesystem("file")
+
+    def to_table(self, index: int | None = None) -> pa.Table:
+        t = io.arrow.from_ipc(self._table_uri())
+
+        if index is not None:
+            i = io.arrow.from_ipc(self._index_uri(index))
+            t = t.append_column(
+                INDEX_COL,
+                i.rename_columns([INDEX_COL]).column(INDEX_COL),
+            )
+
+        return t
+
+    def to_pyarrow(self) -> ds.Dataset:
+        return ds.dataset(self.to_table())
+
+    def count_rows(self, filter: Filter = None) -> int:
+        return self.to_pyarrow().count_rows(filter=filter)
+
+    @property
+    def schema(self) -> pa.Schema:
+        return self.to_table().schema
+
+    def filter(self, expression: pc.Expression) -> "Dataset":
+        raise NotImplementedError()
+
+    def get_fragments(self, filter: pc.Expression | None = None) -> Iterator[ds.Fragment]:
+        raise NotADirectoryError()
+
+    def head(self, num_rows: int, columns: Select = None, filter: Filter = None) -> pa.Table:
+        return self.to_pyarrow().head(num_rows, columns=columns, filter=filter)
+
+    def join(self, *args, **kwargs) -> "Dataset":
+        raise NotADirectoryError()
+
+    def replace_schema(self, schema: pa.Schema) -> pa.Schema:
+        raise NotADirectoryError()
+
+    def scanner(self, columns: Select = None, filter: Filter = None) -> ds.Scanner:
+        return self.to_pyarrow().scanner(columns=columns, filter=filter)
+
+    def sort_by(self, sorting: str | list[tuple[str, str]]) -> "Dataset":
+        raise NotADirectoryError()
+
+    def take(
+        self,
+        indices: Sequence[int] | np.ndarray | pa.Array,
+        columns: Select = None,
+        filter: Filter = None,
+    ) -> pa.Array:
+        if not isinstance(indices, np.ndarray):
+            indices = np.array(indices)
+
+        mask = np.zeros((self.count_rows(),), dtype=np.bool_)
+        np.put(mask, indices, True)
+
+        unique = np.unique(indices)
+        indices = np.searchsorted(unique, indices)
+
+        t = self.to_table()
+
+        if columns is not None:
+            t = t.Select(columns)
+
+        t = t.filter(mask).take(indices)
+
+        if filter is not None:
+            t = t.filter(filter)
+
+        return t
+
+    def to_batches(self, columns: Select = None, filter: Filter = None) -> list[pa.RecordBatch]:
+        return self.to_pyarrow().to_batches(columns=columns, filter=filter)
+
+    def to_reader(self, columns: Select = None, filter: Filter = None) -> Iterator[pa.RecordBatch]:
+        return self.to_pyarrow().to_reader(columns=columns, filter=filter)
+
+    def sample(self, size: int) -> pa.Table:
+        return self.to_table().filter(
+            np.random.permutation(self.count_rows()) < size,
+        )
+
+    def insert_table(self, data: pa.Table | pa.RecordBatchReader) -> "Dataset":
+        if isinstance(data, pa.Table):
+            data = data.to_reader(BATCH_SIZE)
+
+        path = self._table_uri(str(uuid.uuid4())) + ".arrow"
+
+        io.arrow.to_ipc(path, data, data.schema)
+
+        return self.update_index()
+
+    def create_index(self, column: str, config: IndexConfig) -> "Dataset":
+        t = self.to_table()
+        v = t.column(column)
+        q = vq.kmeans(v, **config)
+
+        vers = max(0, *self.list_indexes(), 0) + 1
+        path = self._index_uri(vers)
+
+        self.filesystem.makedirs(path, exist_ok=True)
+
+        with self.filesystem.open(join(path, ".indx.torch"), "wb") as f:
+            data: SavedIndex = {"tensor": q, "column": column, "config": config}
+            torch.save(data, f)
+
+        return self.register_encoder(vers, data).update_index(vers)
+
+    def update_index(self, vers: int | None = None) -> "Dataset":
+        for version, encoder in self.list_indexes().items():
+            if vers is not None and version != vers:
+                continue
+
+            encoder_name = self._index_encoder_name(version)
+
+            for path in self.list_fragments():
+                data = io.arrow.from_ipc(path)
+                path = join(self._index_uri(version), os.path.basename(path))
+
+                if self.filesystem.exists(path):
+                    continue
+
+                indx = ac.from_sequence(
+                    ac.source(data),
+                    ac.select(
+                        {INDEX_COL: ac.map(encoder_name, [ac.col(encoder["column"]), ac.lit(1)])},
+                    ),
+                    ac.select(
+                        {INDEX_COL: ac.map("list_element", [ac.col(INDEX_COL), ac.lit(0)])},
+                    ),
+                ).to_reader()
+
+                io.arrow.to_ipc(path, indx, indx.schema)
+
+        return self
+
+    def list_indexes(self) -> dict[int, SavedIndex]:
+        return {
+            vers: torch.load(join(path, ".indx.torch"))
+            for path in sorted(self.filesystem.glob(join(self.uri, INDEX_DIR, "*")))
+            for vers in [int(os.path.basename(path))]
+        }
+
+    def list_fragments(self) -> Iterator[str]:
+        yield from sorted(
+            self.filesystem.glob(join(self._table_uri(), "*.arrow")),
+        )
 
     def search_index(
         self,
-        query: pa.Table,
-        limit: int,
-        probes: int,
-    ) -> pa.Table:
-        h = self.to_index()
-        assert h is not None
+        query: pa.Array | pa.ChunkedArray | np.ndarray | Tensor,
+        index: int,
+        select: Sequence[str] | None = None,
+        probes: int = 8,
+    ) -> pa.RecordBatchReader:
+        encoder = self.list_indexes().get(index)
+        assert encoder is not None
 
-        query = query.add_column(0, "id", pa.array(np.arange(0, query.num_rows)))
-        query = query.rename_columns([f"target_{c}" for c in query.column_names])
+        metric = encoder["config"]["metric"]
+        column = encoder["column"]
+        type = self.schema.field(column).type
+        size = type.shape[0]
+        func = f"list_{metric}_distance:{type.value_type}:{size}"
 
-        (
-            self.conn.from_arrow(query)
-            .project(
-                duckdb.StarExpression(),  # type:ignore
-                duckdb.FunctionExpression(  # type:ignore
-                    "unnest",
-                    duckdb.FunctionExpression(
-                        "query_hash",
-                        duckdb.ColumnExpression(f"target_{VECTOR_COLUMN}"),
-                        duckdb.ConstantExpression(probes),
-                    ),
-                ).alias(GROUP_ID_COLUMN),
-            )
-            .create(QUERY_NAME)
+        if isinstance(query, pa.ChunkedArray):
+            query = query.combine_chunks()
+
+        if isinstance(query, pa.Array):
+            query = query.to_numpy()
+
+        if isinstance(query, np.ndarray):
+            query = torch.from_numpy(query)
+
+        t = self.to_table(index)
+        q = pa.scalar(query.numpy(), type=type.storage_type)
+        i = pa.array(
+            vq.encode(query, encoder["tensor"], probes, metric).squeeze().numpy(),
         )
 
-        metric = metric_expression(h.metric)
+        if select is None:
+            select = [f.name for f in t.schema if not isinstance(f.type, pa.FixedShapeTensorType)]
 
-        r = self.conn.sql(
-            f"""
-            SELECT
-              target.* EXCLUDE(target_{VECTOR_COLUMN}, {GROUP_ID_COLUMN})
-            , source.* EXCLUDE({VECTOR_COLUMN}, {GROUP_ID_COLUMN})
-            , {GROUP_ID_COLUMN}
-            , {metric}(target.target_{VECTOR_COLUMN}, source.{VECTOR_COLUMN}) AS {DISTANCE_COLUMN}
-            FROM {QUERY_NAME} AS target
-                INNER JOIN {TABLE_NAME} AS source USING ({GROUP_ID_COLUMN})
-            QUALIFY ROW_NUMBER() OVER(PARTITION BY target.target_id ORDER BY {DISTANCE_COLUMN}) < {limit}
-            ORDER BY target.target_id, {DISTANCE_COLUMN}
-            """
-        ).fetch_arrow_table()
-
-        self.conn.sql(f"DROP TABLE {QUERY_NAME}")
-
-        return r.rename_columns(
-            [
-                f"source_{c}"
-                if not c.startswith("target_") and c not in {GROUP_ID_COLUMN, DISTANCE_COLUMN}
-                else c
-                for c in r.column_names
-            ]
-        )
-
-    def search_table(
-        self,
-        query: pa.Table,
-        limit: int,
-        metric: str,
-    ) -> pa.Table:
-        query = query.add_column(0, "id", pa.array(np.arange(0, query.num_rows)))
-        query = query.rename_columns([f"target_{c}" for c in query.column_names])
-
-        self.conn.from_arrow(query).create(QUERY_NAME)
-
-        metric = metric_expression(metric)
-
-        r = self.conn.sql(
-            f"""
-            SELECT
-              target.* EXCLUDE(target_{VECTOR_COLUMN})
-            , source.* EXCLUDE({VECTOR_COLUMN})
-            , {metric}(target.target_{VECTOR_COLUMN}, source.{VECTOR_COLUMN}) AS {DISTANCE_COLUMN}
-            FROM
-              {QUERY_NAME} AS target
-            , {TABLE_NAME} AS source
-            QUALIFY ROW_NUMBER() OVER(PARTITION BY target.target_id ORDER BY {DISTANCE_COLUMN}) < {limit}
-            ORDER BY target.target_id, {DISTANCE_COLUMN}
-            """
-        ).fetch_arrow_table()
-
-        self.conn.sql(f"DROP TABLE {QUERY_NAME}")
-
-        return r.rename_columns(
-            [
-                f"source_{c}"
-                if not c.startswith("target_") and c not in {GROUP_ID_COLUMN, DISTANCE_COLUMN}
-                else c
-                for c in r.column_names
-            ]
-        )
+        return ac.from_sequence(
+            ac.source(t),
+            ac.filter(ac.col(INDEX_COL).isin(i)),
+            ac.select(
+                *select,
+                **{SCORE_COL: ac.map(func, [ac.col(column), q])},
+            ),
+            ac.order_by([(SCORE_COL, "ascending")]),
+        ).to_reader()
