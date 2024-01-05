@@ -125,7 +125,7 @@ class Server(fl.FlightServerBase):
 
 
 @dataclass
-class Client:
+class Remote:
     uri: str
 
     @functools.cached_property
@@ -141,7 +141,7 @@ class Client:
         reader = self.conn.do_get(ticket)
         return reader.to_reader()
 
-    def insert_table(self, name: str, data: pa.Table | pa.RecordBatchReader) -> "Client":
+    def insert_table(self, name: str, data: pa.Table | pa.RecordBatchReader) -> "Remote":
         data = data if isinstance(data, pa.RecordBatchReader) else data.to_reader()
         desc = fl.FlightDescriptor.for_path(*name.split(os.path.sep))
 
@@ -152,7 +152,7 @@ class Client:
 
         return self
 
-    def create_index(self, name: str, column: str, config: IndexConfig) -> "Client":
+    def create_index(self, name: str, column: str, config: IndexConfig) -> "Remote":
         self.conn.do_action(
             fl.Action(
                 "create-index",
