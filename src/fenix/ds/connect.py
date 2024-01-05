@@ -1,9 +1,9 @@
 from fenix.ds.dataset import Dataset
-from fenix.ds.flight import FlightDataset
+from fenix.ds.flight import RemoteDataset
 
 
-def connect(uri: str) -> Dataset | FlightDataset:
+def connect(uri: str) -> Dataset | RemoteDataset:
     if uri.startswith("grpc://"):
-        return FlightDataset(uri)
+        return RemoteDataset(uri)
 
     return Dataset(uri)

@@ -1,39 +1,59 @@
 import functools
-from typing import Iterator
+import os
+import pickle
+from dataclasses import dataclass
+from os.path import join
+from typing import Iterator, Sequence
 
+import fsspec
 import msgspec
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.flight as fl
-from torch import Tensor
 
-from fenix.ds.dataset import Dataset, IndexConfig
+from fenix.ds.dataset import INDEX_DIR, TABLE_DIR, Dataset, IndexConfig
 
 
-class FlightServer(fl.FlightServerBase):
-    def __init__(
-        self,
-        database: str,
-        location: str | None = None,
-    ) -> None:
-        super().__init__(location=location)
+@dataclass
+class Server(fl.FlightServerBase):
+    database: str
+    location: str | None = None
 
-        self.dataset = Dataset(database)
-        self.location = location if location is not None else f"grpc://0.0.0.0:{self.port}"
+    def __post_init__(self) -> None:
+        super().__init__(location=self.grpc_uri)
+
+        self.database = os.path.abspath(self.database)
+
+        if self.location is None:
+            self.location = f"grpc://0.0.0.0:{self.port}"
+
+    @functools.cached_property
+    def filesystem(self) -> fsspec.AbstractFileSystem:
+        return fsspec.filesystem("file")
+
+    @staticmethod
+    def descriptor_to_name(desc: fl.FlightDescriptor) -> str:
+        return join(*map(bytes.decode, desc.path))
+
+    def descriptor_to_path(self, desc: fl.FlightDescriptor) -> str:
+        return join(self.database, self.descriptor_to_name(desc))
+
+    def descriptor_to_data(self, desc: fl.FlightDescriptor) -> Dataset:
+        return Dataset(self.descriptor_to_path(desc))
 
     def get_flight_info(
         self,
         ctx: fl.ServerCallContext,
         descriptor: fl.FlightDescriptor,
     ) -> fl.FlightInfo:
-        name = descriptor.path[0].decode()
-        data = self.dataset.table(name)
-
+        name = self.descriptor_to_name(descriptor)
+        data = self.descriptor_to_data(descriptor).to_table()
         return fl.FlightInfo(
             schema=data.schema,
             descriptor=descriptor,
             endpoints=[fl.FlightEndpoint(name, [self.location])],
-            total_records=sum(len(batch) for batch in data),
-            total_bytes=sum(batch.nbytes for batch in data),
+            total_records=data.num_rows,
+            total_bytes=data.nbytes,
         )
 
     def list_flights(
@@ -41,11 +61,11 @@ class FlightServer(fl.FlightServerBase):
         ctx: fl.ServerCallContext,
         criteria: bytes,
     ) -> Iterator[fl.FlightDescriptor]:
-        for name in self.dataset.list_tables():
-            yield self.get_flight_info(
-                ctx,
-                fl.FlightDescriptor.for_path(name),
-            )
+        for path, dirs, _ in self.filesystem.walk(self.database):
+            if set(dirs) == {TABLE_DIR, INDEX_DIR}:
+                name = path.removeprefix(self.database).removeprefix(os.path.sep)
+                desc = fl.FlightDescriptor.for_path(*name.split(os.path.sep))
+                yield self.get_flight_info(ctx, desc)
 
     def do_put(
         self,
@@ -54,18 +74,14 @@ class FlightServer(fl.FlightServerBase):
         reader: fl.MetadataRecordBatchReader,
         writer: fl.FlightMetadataWriter,
     ) -> None:
-        name = descriptor.path[0].decode()
-
-        if name in self.dataset.list_tables():
-            self.dataset.update_table(name, reader.read_all())
-        else:
-            self.dataset.create_table(name, reader.read_all())
+        self.descriptor_to_data(descriptor).insert_table(
+            pa.RecordBatchReader(reader.schema, reader)
+        )
 
     def do_get(self, ctx: fl.ServerCallContext, ticket: fl.Ticket):
-        name = ticket.ticket.decode()
-        data = self.dataset.table(name)
-
-        return fl.GeneratorStream(data.schema, data)
+        desc = fl.FlightDescriptor.for_path(*ticket.ticket)
+        data = self.descriptor_to_data(desc)
+        return fl.GeneratorStream(data.schema, data.to_reader())
 
     def do_exchange(
         self,
@@ -74,184 +90,112 @@ class FlightServer(fl.FlightServerBase):
         reader: fl.MetadataRecordBatchReader,
         writer: fl.MetadataRecordBatchWriter,
     ) -> None:
-        body = msgspec.json.decode(descriptor.command)
+        param = msgspec.json.decode(descriptor.command)
 
-        if body["search"]["type"] == "index":
-            data = self.dataset.search_index(
-                table=body["table"],
-                query=reader.read_all(),
-                **body["search"]["args"],
-            )
+        if param["args"]["filter"] is not None:
+            param["args"]["filter"] = pickle.loads(param["args"]["filter"])
 
-        elif body["search"]["type"] == "table":
-            data = self.dataset.search_table(
-                table=body["table"],
-                query=reader.read_all(),
-                **body["search"]["args"],
-            )
+        query = reader.read_all()[0].combine_chunks()
+        table = Dataset(join(self.database, param["name"]))
 
-        else:
-            raise ValueError()
+        match param["type"]:
+            case "index":
+                r = table.search_index(query, **param["args"])
 
-        writer.begin(data.schema)
-        writer.write_table(data)
+            case "table":
+                r = table.search_table(query, **param["args"])
+
+            case _:
+                raise ValueError()
+
+        writer.begin(r.schema)
+
+        for batch in r:
+            writer.write_batch(batch)
 
     def do_action(self, ctx: fl.ServerCallContext, action: fl.Action) -> None:
         body = msgspec.json.decode(action.body.to_pybytes())
 
         match action.type:
-            case "remove-table":
-                self.dataset.remove_table(**body)
-
             case "create-index":
                 self.dataset.create_index(**body)
-
-            case "remove-index":
-                self.dataset.remove_index(**body)
-
-            case "update-index":
-                self.dataset.remove_index(**body)
 
             case _:
                 raise ValueError()
 
 
-class FlightDataset(msgspec.Struct, frozen=True, dict=True):
+@dataclass
+class Client:
     uri: str
 
     @functools.cached_property
-    def connect(self) -> fl.FlightClient:
+    def conn(self) -> fl.FlightClient:
         return fl.connect(self.uri)
 
-    def list_tables(self) -> list[str]:
-        return [
-            flight.endpoints[0].ticket.ticket.decode() for flight in self.connect.list_flights()
-        ]
+    def __del__(self) -> None:
+        self.conn.close()
 
-    def _insert_data(self, name: str, data: pa.Table | pa.RecordBatchReader) -> None:
+    def to_table(self, name: str) -> pa.RecordBatchReader:
+        flight = self.conn.get_flight_info(fl.FlightDescriptor.for_path(*name.split(os.path.sep)))
+        ticket = flight.endpoints[0].ticket
+        reader = self.conn.do_get(ticket)
+        return reader.to_reader()
+
+    def insert_table(self, name: str, data: pa.Table | pa.RecordBatchReader) -> "Client":
         data = data if isinstance(data, pa.RecordBatchReader) else data.to_reader()
+        desc = fl.FlightDescriptor.for_path(*name.split(os.path.sep))
 
-        descriptor = fl.FlightDescriptor.for_path(name)
-        writer, reader = self.connect.do_put(descriptor, data.schema)
+        writer, reader = self.conn.do_put(desc, data.schema)
 
         for batch in data:
             writer.write_batch(batch)
 
-        writer.close()
+        return self
 
-    def create_table(self, name: str, data: pa.Table | pa.RecordBatchReader) -> None:
-        assert name not in self.list_tables()
-        self._insert_data(name, data)
-
-    def update_table(self, name: str, data: pa.Table | pa.RecordBatchReader) -> None:
-        assert name in self.list_tables()
-        self._insert_data(name, data)
-
-    def remove_table(self, name: str) -> None:
-        assert name in self.list_tables()
-        self.connect.do_action(
-            fl.Action(
-                "remove-table",
-                msgspec.json.encode({"name": name}),
-            )
-        )
-
-    def create_index(self, name: str, conf: IndexConfig) -> None:
-        assert name in self.list_tables()
-        self.connect.do_action(
+    def create_index(self, name: str, column: str, config: IndexConfig) -> "Client":
+        self.conn.do_action(
             fl.Action(
                 "create-index",
-                msgspec.json.encode({"name": name, "conf": conf}),
+                msgspec.json.encode({"name": name, "column": column, "config": config}),
             )
         )
 
-    def update_index(self, name: str, conf: IndexConfig) -> None:
-        assert name in self.list_tables()
-        self.connect.do_action(
-            fl.Action(
-                "update-index",
-                msgspec.json.encode({"name": name, "conf": conf}),
-            )
-        )
-
-    def remove_index(self, name: str) -> None:
-        assert name in self.list_tables()
-        self.connect.do_action(
-            fl.Action(
-                "remove-index",
-                msgspec.json.encode({"name": name}),
-            )
-        )
-
-    def table(self, name: str) -> pa.RecordBatchReader:
-        flight = self.connect.get_flight_info(fl.FlightDescriptor.for_path(name))
-        ticket = flight.endpoints[0].ticket
-        reader = self.connect.do_get(ticket)
-        return reader.to_reader()
-
-    def index(self, name: str) -> Tensor:
-        raise NotImplementedError()
+        return self
 
     def search_index(
         self,
-        table: str,
         query: pa.Table,
-        limit: int,
-        probes: int,
-    ) -> pa.Table:
+        table: str,
+        index: int,
+        select: Sequence[str] | None = None,
+        filter: pc.Expression | None = None,
+        probes: int = 8,
+    ) -> pa.RecordBatchReader:
         descriptor = fl.FlightDescriptor.for_command(
             msgspec.json.encode(
                 {
-                    "table": table,
-                    "search": {
-                        "type": "index",
-                        "conf": {
-                            "limit": limit,
-                            "probes": probes,
-                        },
+                    "name": table,
+                    "type": "index",
+                    "args": {
+                        "index": index,
+                        "select": select,
+                        "filter": filter if filter is None else pickle.dumps(filter),
+                        "probes": probes,
                     },
                 }
             )
         )
 
-        writer, reader = self.connect.do_exchange(descriptor)
+        writer, reader = self.conn.do_exchange(descriptor)
 
         with writer:
             writer.begin(query.schema)
             writer.write_table(query)
             writer.done_writing()
 
-            return reader.read_all()
+        return pa.RecordBatchReader.from_batches(reader)
 
-    def search_table(
-        self,
-        table: str,
-        query: pa.Table,
-        limit: int,
-        column: str,
-        metric: str,
-    ) -> pa.Table:
-        descriptor = fl.FlightDescriptor.for_command(
-            msgspec.json.encode(
-                {
-                    "table": table,
-                    "search": {
-                        "type": "table",
-                        "conf": {
-                            "limit": limit,
-                            "column": column,
-                            "metric": metric,
-                        },
-                    },
-                }
-            )
-        )
 
-        writer, reader = self.connect.do_exchange(descriptor)
-
-        with writer:
-            writer.begin(query.schema)
-            writer.write_table(query)
-            writer.done_writing()
-
-            return reader.read_all()
+@dataclass
+class RemoteDataset(Dataset):
+    ...
