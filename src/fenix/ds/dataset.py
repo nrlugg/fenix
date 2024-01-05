@@ -14,7 +14,7 @@ import torch
 import xxhash
 from torch import Tensor
 
-import fenix.ex.acero as ac
+import fenix.ds.acero as ac
 import fenix.io as io
 import fenix.vq as vq
 
@@ -158,7 +158,7 @@ class Dataset(ds.Dataset):
     def to_pyarrow(self) -> ds.Dataset:
         return ds.dataset(self.to_table())
 
-    def count_rows(self, filter: Filter = None) -> int:
+    def count_rows(self, filter: pc.Expression | None = None) -> int:
         return self.to_pyarrow().count_rows(filter=filter)
 
     @property
@@ -171,7 +171,9 @@ class Dataset(ds.Dataset):
     def get_fragments(self, filter: pc.Expression | None = None) -> Iterator[ds.Fragment]:
         raise NotADirectoryError()
 
-    def head(self, num_rows: int, columns: Select = None, filter: Filter = None) -> pa.Table:
+    def head(
+        self, num_rows: int, columns: Select = None, filter: pc.Expression | None = None
+    ) -> pa.Table:
         return self.to_pyarrow().head(num_rows, columns=columns, filter=filter)
 
     def join(self, *args, **kwargs) -> "Dataset":
@@ -180,7 +182,7 @@ class Dataset(ds.Dataset):
     def replace_schema(self, schema: pa.Schema) -> pa.Schema:
         raise NotADirectoryError()
 
-    def scanner(self, columns: Select = None, filter: Filter = None) -> ds.Scanner:
+    def scanner(self, columns: Select = None, filter: pc.Expression | None = None) -> ds.Scanner:
         return self.to_pyarrow().scanner(columns=columns, filter=filter)
 
     def sort_by(self, sorting: str | list[tuple[str, str]]) -> "Dataset":
@@ -190,7 +192,7 @@ class Dataset(ds.Dataset):
         self,
         indices: Sequence[int] | np.ndarray | pa.Array,
         columns: Select = None,
-        filter: Filter = None,
+        filter: pc.Expression | None = None,
     ) -> pa.Array:
         if not isinstance(indices, np.ndarray):
             indices = np.array(indices)
@@ -213,10 +215,14 @@ class Dataset(ds.Dataset):
 
         return t
 
-    def to_batches(self, columns: Select = None, filter: Filter = None) -> list[pa.RecordBatch]:
+    def to_batches(
+        self, columns: Select = None, filter: pc.Expression | None = None
+    ) -> list[pa.RecordBatch]:
         return self.to_pyarrow().to_batches(columns=columns, filter=filter)
 
-    def to_reader(self, columns: Select = None, filter: Filter = None) -> Iterator[pa.RecordBatch]:
+    def to_reader(
+        self, columns: Select = None, filter: pc.Expression | None = None
+    ) -> Iterator[pa.RecordBatch]:
         return self.to_pyarrow().to_reader(columns=columns, filter=filter)
 
     def sample(self, size: int) -> pa.Table:
@@ -267,10 +273,14 @@ class Dataset(ds.Dataset):
                 indx = ac.from_sequence(
                     ac.source(data),
                     ac.select(
-                        {INDEX_COL: ac.map(encoder_name, [ac.col(encoder["column"]), ac.lit(1)])},
+                        **{
+                            INDEX_COL: ac.map(encoder_name, [ac.col(encoder["column"]), ac.lit(1)])
+                        },
                     ),
                     ac.select(
-                        {INDEX_COL: ac.map("list_element", [ac.col(INDEX_COL), ac.lit(0)])},
+                        **{
+                            INDEX_COL: ac.map("list_element", [ac.col(INDEX_COL), ac.lit(0)]),
+                        },
                     ),
                 ).to_reader()
 
@@ -294,7 +304,9 @@ class Dataset(ds.Dataset):
         self,
         query: pa.Array | pa.ChunkedArray | np.ndarray | Tensor,
         index: int,
+        limit: int,
         select: Sequence[str] | None = None,
+        filter: pc.Expression | None = None,
         probes: int = 8,
     ) -> pa.RecordBatchReader:
         encoder = self.list_indexes().get(index)
@@ -315,21 +327,30 @@ class Dataset(ds.Dataset):
         if isinstance(query, np.ndarray):
             query = torch.from_numpy(query)
 
-        t = self.to_table(index)
-        q = pa.scalar(query.numpy(), type=type.storage_type)
-        i = pa.array(
-            vq.encode(query, encoder["tensor"], probes, metric).squeeze().numpy(),
+        source = self.to_table(index)
+        target = pa.scalar(query.numpy(), type=type.storage_type)
+        groups = pc.field(INDEX_COL).isin(
+            pa.array(
+                vq.encode(query, encoder["tensor"], probes, metric).squeeze().numpy(),
+            )
         )
 
         if select is None:
-            select = [f.name for f in t.schema if not isinstance(f.type, pa.FixedShapeTensorType)]
+            select = [
+                f.name for f in source.schema if not isinstance(f.type, pa.FixedShapeTensorType)
+            ]
+
+        if filter is None:
+            filter = groups
+        else:
+            filter = groups & filter
 
         return ac.from_sequence(
-            ac.source(t),
-            ac.filter(ac.col(INDEX_COL).isin(i)),
+            ac.source(source),
+            ac.filter(filter),
             ac.select(
                 *select,
-                **{SCORE_COL: ac.map(func, [ac.col(column), q])},
+                **{SCORE_COL: ac.map(func, [ac.col(column), target])},
             ),
             ac.order_by([(SCORE_COL, "ascending")]),
         ).to_reader()
