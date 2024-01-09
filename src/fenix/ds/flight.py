@@ -3,51 +3,57 @@ import os
 import pickle
 from dataclasses import dataclass
 from os.path import join
-from typing import Iterator, Sequence
+from typing import Iterator, Sequence, TypedDict
 
 import fsspec
 import msgspec
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.flight as fl
+from torch import Tensor
 
-from fenix.ds.dataset import INDEX_DIR, TABLE_DIR, Dataset, IndexConfig
+import fenix.ds.dataset as ds
+
+
+class DatasetDescriptor(TypedDict):
+    table: str
+    index: ds.Index | None
 
 
 @dataclass
-class Server(fl.FlightServerBase):
+class DatasetServer(fl.FlightServerBase):
     database: str
     location: str | None = None
 
     def __post_init__(self) -> None:
-        super().__init__(location=self.grpc_uri)
+        super().__init__(location=self.location)
+
+        fs = fsspec.filesystem("file")
 
         self.database = os.path.abspath(self.database)
+        self.datasets = {
+            name: ds.Dataset(path)
+            for path, dirs, _ in fs.walk(self.database)
+            if set(dirs) == {ds.TABLE_PATH, ds.INDEX_PATH}
+            for name in [path.removeprefix(self.database).removeprefix("/")]
+        }
 
         if self.location is None:
             self.location = f"grpc://0.0.0.0:{self.port}"
-
-    @functools.cached_property
-    def filesystem(self) -> fsspec.AbstractFileSystem:
-        return fsspec.filesystem("file")
-
-    @staticmethod
-    def descriptor_to_name(desc: fl.FlightDescriptor) -> str:
-        return join(*map(bytes.decode, desc.path))
-
-    def descriptor_to_path(self, desc: fl.FlightDescriptor) -> str:
-        return join(self.database, self.descriptor_to_name(desc))
-
-    def descriptor_to_data(self, desc: fl.FlightDescriptor) -> Dataset:
-        return Dataset(self.descriptor_to_path(desc))
 
     def get_flight_info(
         self,
         ctx: fl.ServerCallContext,
         descriptor: fl.FlightDescriptor,
     ) -> fl.FlightInfo:
-        name = self.descriptor_to_name(descriptor)
-        data = self.descriptor_to_data(descriptor).to_table()
+        body = msgspec.json.decode(descriptor.command)
+        name = body["table"]
+        data = self.datasets[name].to_table(index=body["index"])
+
+        if body["index"] is not None:
+            name = f"{name}:{ds.index_name(body['index'])}"
+
         return fl.FlightInfo(
             schema=data.schema,
             descriptor=descriptor,
@@ -61,11 +67,21 @@ class Server(fl.FlightServerBase):
         ctx: fl.ServerCallContext,
         criteria: bytes,
     ) -> Iterator[fl.FlightDescriptor]:
-        for path, dirs, _ in self.filesystem.walk(self.database):
-            if set(dirs) == {TABLE_DIR, INDEX_DIR}:
-                name = path.removeprefix(self.database).removeprefix(os.path.sep)
-                desc = fl.FlightDescriptor.for_path(*name.split(os.path.sep))
-                yield self.get_flight_info(ctx, desc)
+        for name in self.datasets:
+            yield self.get_flight_info(
+                ctx,
+                fl.FlightDescriptor.for_command(
+                    msgspec.json.encode({"table": name, "index": None})
+                ),
+            )
+
+            for spec in self.datasets[name].list_indexes():
+                yield self.get_flight_info(
+                    ctx,
+                    fl.FlightDescriptor.for_command(
+                        msgspec.json.encode({"table": name, "index": spec["index"]})
+                    ),
+                )
 
     def do_put(
         self,
@@ -74,13 +90,32 @@ class Server(fl.FlightServerBase):
         reader: fl.MetadataRecordBatchReader,
         writer: fl.FlightMetadataWriter,
     ) -> None:
-        self.descriptor_to_data(descriptor).insert_table(
-            pa.RecordBatchReader(reader.schema, reader)
+        body = msgspec.json.decode(descriptor.command)
+        name = body["table"]
+        path = join(self.database, name)
+
+        if name not in self.datasets:
+            self.datasets[name] = ds.Dataset(path)
+
+        self.datasets[name] = self.datasets[name].insert_table(
+            pa.RecordBatchReader.from_batches(reader.schema, reader.to_reader()),
         )
 
     def do_get(self, ctx: fl.ServerCallContext, ticket: fl.Ticket):
-        desc = fl.FlightDescriptor.for_path(*ticket.ticket)
-        data = self.descriptor_to_data(desc)
+        name = ticket.ticket.decode()
+
+        index: ds.Index | None
+        if ":" in name:
+            name, spec = ticket.ticket.decode().split(":")
+
+            column, metric, version = spec.split("/")
+            index = {"column": column, "metric": metric, "version": version}
+
+        else:
+            index = None
+
+        data = self.datasets[name].to_table(index=index)
+
         return fl.GeneratorStream(data.schema, data.to_reader())
 
     def do_exchange(
@@ -90,94 +125,145 @@ class Server(fl.FlightServerBase):
         reader: fl.MetadataRecordBatchReader,
         writer: fl.MetadataRecordBatchWriter,
     ) -> None:
-        param = msgspec.json.decode(descriptor.command)
+        body = msgspec.json.decode(descriptor.command)
+        name = body["table"]
 
-        if param["args"]["filter"] is not None:
-            param["args"]["filter"] = pickle.loads(param["args"]["filter"])
+        if body["param"]["filter"] is not None:
+            body["param"]["filter"] = pickle.loads(body["param"]["filter"])
 
-        query = reader.read_all()[0].combine_chunks()
-        table = Dataset(join(self.database, param["name"]))
+        data = self.datasets[name].search_index(
+            reader.read_all().column("vector").combine_chunks(),
+            **body["param"],
+        )
 
-        match param["type"]:
-            case "index":
-                r = table.search_index(query, **param["args"])
-
-            case "table":
-                r = table.search_table(query, **param["args"])
-
-            case _:
-                raise ValueError()
-
-        writer.begin(r.schema)
-
-        for batch in r:
-            writer.write_batch(batch)
+        writer.begin(data.schema)
+        writer.write_table(data)
 
     def do_action(self, ctx: fl.ServerCallContext, action: fl.Action) -> None:
         body = msgspec.json.decode(action.body.to_pybytes())
+        name = body.pop("table")
+        data = self.datasets[name]
 
         match action.type:
             case "create-index":
-                self.dataset.create_index(**body)
+                data.create_index(**body["param"])
 
             case _:
                 raise ValueError()
 
 
 @dataclass
-class Remote:
+class RemoteDataset(pa.dataset.Dataset):
     uri: str
+
+    @property
+    def host(self) -> str:
+        host, *ame = self.uri.removeprefix("grpc://").split("/")
+        return join("grpc://", host)
+
+    @property
+    def name(self) -> str:
+        return self.uri.removeprefix(self.host).removeprefix("/")
 
     @functools.cached_property
     def conn(self) -> fl.FlightClient:
-        return fl.connect(self.uri)
+        return fl.connect(self.host)
 
     def __del__(self) -> None:
         self.conn.close()
 
-    def to_table(self, name: str) -> pa.RecordBatchReader:
-        flight = self.conn.get_flight_info(fl.FlightDescriptor.for_path(*name.split(os.path.sep)))
-        ticket = flight.endpoints[0].ticket
-        reader = self.conn.do_get(ticket)
-        return reader.to_reader()
+    def to_table(self, index: ds.Index | None = None) -> pa.RecordBatchReader:
+        ticket = self.name
 
-    def insert_table(self, name: str, data: pa.Table | pa.RecordBatchReader) -> "Remote":
+        if index is not None:
+            ticket = f"{ticket}:{ds.index_name(index)}"
+
+        return self.conn.do_get(fl.Ticket(ticket)).to_reader()
+
+    def scanner(
+        self, columns: Sequence[str] | None = None, filter: pc.Expression | None = None
+    ) -> pa.dataset.Scanner:
+        return pa.dataset.Scanner.from_batches(
+            self.to_table(),
+            columns=columns,
+            filter=filter,
+        )
+
+    def count_rows(self, filter: pc.Expression | None = None) -> int:
+        return self.scanner().count_rows(filter=filter)
+
+    def filter(self, expression: pc.Expression) -> "RemoteDataset":
+        raise NotImplementedError()
+
+    def get_fragments(self, filter: pc.Expression | None = None) -> Iterator[pa.dataset.Fragment]:
+        raise NotImplementedError()
+
+    def head(
+        self,
+        num_rows: int,
+        columns: Sequence[str] | None = None,
+        filter: pc.Expression | None = None,
+    ) -> pa.Table:
+        return self.scanner().head(num_rows, columns=columns, filter=filter)
+
+    def join(self, *args, **kwargs) -> "RemoteDataset":
+        raise NotImplementedError()
+
+    def replace_schema(self, schema: pa.Schema) -> pa.Schema:
+        raise NotImplementedError()
+
+    def sort_by(self, sorting: str | list[tuple[str, str]]) -> "RemoteDataset":
+        raise NotImplementedError()
+
+    def take(
+        self,
+        indices: Sequence[int] | np.ndarray | pa.Array,
+        columns: Sequence[str] | None = None,
+        filter: pc.Expression | None = None,
+    ) -> pa.Array:
+        return self.scanner().take(indices, columns=columns, filter=filter)
+
+    def to_batches(
+        self, columns: Sequence[str] | None = None, filter: pc.Expression | None = None
+    ) -> list[pa.RecordBatch]:
+        return self.scanner().to_batches(columns=columns, filter=filter)
+
+    def to_reader(
+        self, columns: Sequence[str] | None = None, filter: pc.Expression | None = None
+    ) -> Iterator[pa.RecordBatch]:
+        return self.scanner().to_reader(columns=columns, filter=filter)
+
+    def insert_table(self, data: pa.Table | pa.RecordBatchReader) -> "RemoteDataset":
         data = data if isinstance(data, pa.RecordBatchReader) else data.to_reader()
-        desc = fl.FlightDescriptor.for_path(*name.split(os.path.sep))
+
+        desc = fl.FlightDescriptor.for_command(
+            msgspec.json.encode({"table": self.name, "index": None}),
+        )
 
         writer, reader = self.conn.do_put(desc, data.schema)
 
-        for batch in data:
-            writer.write_batch(batch)
+        with writer:
+            for batch in data:
+                writer.write_batch(batch)
 
-        return self
-
-    def create_index(self, name: str, column: str, config: IndexConfig) -> "Remote":
-        self.conn.do_action(
-            fl.Action(
-                "create-index",
-                msgspec.json.encode({"name": name, "column": column, "config": config}),
-            )
-        )
-
-        return self
+        return RemoteDataset(self.uri)
 
     def search_index(
         self,
-        query: pa.Table,
-        table: str,
-        index: int,
+        query: pa.Array | pa.ChunkedArray | pa.FixedSizeListScalar | np.ndarray | Tensor,
+        index: ds.Index,
+        limit: int,
         select: Sequence[str] | None = None,
         filter: pc.Expression | None = None,
-        probes: int = 8,
-    ) -> pa.RecordBatchReader:
+        probes: int | None = None,
+    ) -> pa.Table:
         descriptor = fl.FlightDescriptor.for_command(
             msgspec.json.encode(
                 {
-                    "name": table,
-                    "type": "index",
-                    "args": {
+                    "table": self.name,
+                    "param": {
                         "index": index,
+                        "limit": limit,
                         "select": select,
                         "filter": filter if filter is None else pickle.dumps(filter),
                         "probes": probes,
@@ -188,14 +274,35 @@ class Remote:
 
         writer, reader = self.conn.do_exchange(descriptor)
 
+        if isinstance(query, Tensor):
+            query = query.numpy()
+
+        if isinstance(query, np.ndarray):
+            query = pa.array(query)
+
+        query = pa.table({"vector": query})
+
         with writer:
             writer.begin(query.schema)
             writer.write_table(query)
             writer.done_writing()
 
-        return pa.RecordBatchReader.from_batches(reader)
+            return reader.read_all()
 
+    def create_index(self, index: ds.Index, config: ds.IndexConfig) -> "RemoteDataset":
+        action = fl.Action(
+            "create-index",
+            msgspec.json.encode(
+                {
+                    "table": self.name,
+                    "param": {
+                        "index": index,
+                        "config": config,
+                    },
+                },
+            ),
+        )
 
-@dataclass
-class RemoteDataset(Dataset):
-    ...
+        self.conn.do_action(action)
+
+        return RemoteDataset(self.uri)

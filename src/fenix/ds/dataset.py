@@ -8,7 +8,6 @@ import fsspec
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.dataset as ds
 import torch
 import xxhash
 from torch import Tensor
@@ -74,7 +73,7 @@ def index_dist(type: pa.DataType, index: Index) -> str:
 
 
 @dataclass(frozen=True)
-class Dataset(ds.Dataset):
+class Dataset(pa.dataset.Dataset):
     uri: str
 
     def __post_init__(self) -> None:
@@ -114,8 +113,8 @@ class Dataset(ds.Dataset):
 
     def scanner(
         self, columns: Sequence[str] | None = None, filter: pc.Expression | None = None
-    ) -> ds.Scanner:
-        return ds.Scanner.from_batches(
+    ) -> pa.dataset.Scanner:
+        return pa.dataset.Scanner.from_batches(
             self.to_table().to_reader(BATCH_SIZE),
             columns=columns,
             filter=filter,
@@ -127,7 +126,7 @@ class Dataset(ds.Dataset):
     def filter(self, expression: pc.Expression) -> "Dataset":
         raise NotImplementedError()
 
-    def get_fragments(self, filter: pc.Expression | None = None) -> Iterator[ds.Fragment]:
+    def get_fragments(self, filter: pc.Expression | None = None) -> Iterator[pa.dataset.Fragment]:
         raise NotADirectoryError()
 
     def head(
@@ -258,7 +257,7 @@ class Dataset(ds.Dataset):
             ac.order_by([(SCORE_NAME, "ascending")]),
         ).to_reader()
 
-        return ds.Scanner.from_batches(reader).take(np.arange(limit))
+        return pa.dataset.Scanner.from_batches(reader).take(np.arange(limit))
 
     def create_index(self, index: Index, config: IndexConfig) -> "Dataset":
         fs = fsspec.filesystem("file")
