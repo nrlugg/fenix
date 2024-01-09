@@ -9,7 +9,10 @@ def source(table: pa.Table) -> ac.Declaration:
     return ac.Declaration("table_source", ac.TableSourceNodeOptions(table))
 
 
-def filter(expression: pc.Expression) -> ac.Declaration:
+def filter(expression: pc.Expression | None) -> ac.Declaration | None:
+    if expression is None:
+        return None
+
     return ac.Declaration("filter", ac.FilterNodeOptions(expression))
 
 
@@ -38,5 +41,5 @@ def lit(value: Any) -> pc.Expression:
     return pc.scalar(value)
 
 
-def from_sequence(*nodes: ac.Declaration) -> ac.Declaration:
-    return ac.Declaration.from_sequence(list(nodes))
+def from_sequence(*nodes: ac.Declaration | None) -> ac.Declaration:
+    return ac.Declaration.from_sequence([node for node in nodes if node is not None])
