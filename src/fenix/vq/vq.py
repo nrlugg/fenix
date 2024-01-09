@@ -6,27 +6,9 @@ import pyarrow.compute as pc
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from tqdm import tqdm
 
-ARROW_TO_TORCH_DTYPE: dict[pa.DataType, torch.dtype] = {
-    pa.float16(): torch.float16,
-    pa.float32(): torch.float32,
-    pa.float64(): torch.float64,
-}
-
-
-def arrow_to_torch(
-    v: pa.FixedShapeTensorArray | pa.FixedSizeListArray | pa.FixedSizeListScalar
-) -> Tensor:
-    if isinstance(v, pa.FixedSizeListScalar):
-        return torch.from_numpy(v.values.to_numpy())
-
-    if isinstance(v, pa.FixedSizeListArray):
-        return torch.from_numpy(v.values.to_numpy()).view(-1, v.type.list_size)
-
-    if isinstance(v, pa.FixedShapeTensorArray):
-        return torch.from_numpy(v.to_numpy_ndarray())
-
-    raise TypeError()
+import fenix.io as io
 
 
 def distance(u: Tensor, v: Tensor, metric: str) -> Tensor:
@@ -59,10 +41,10 @@ def update(v: Tensor, q: Tensor, metric: str) -> Tensor:
     return q
 
 
-def sample(data: pa.FixedShapeTensorArray, size: Sequence[int]) -> Tensor:
+def sample(data: pa.FixedSizeListArray, size: Sequence[int]) -> Tensor:
     mask = np.random.permutation(len(data)) < np.prod(size)
     data = pc.array_filter(data, mask).combine_chunks()
-    return arrow_to_torch(data).view(*size, -1)
+    return io.arrow.to_torch(data).view(*size, -1)
 
 
 @torch.inference_mode()
@@ -78,13 +60,14 @@ def kmeans(
 
     q = sample(x, (n, k))
 
-    for _ in range(num_samples):
+    for _ in tqdm(range(num_samples)):
         v = sample(x, (n, sample_size))
         q = f(v, q, metric=metric)
 
     return q
 
 
+@torch.inference_mode()
 def encode(x: Tensor, q: Tensor, limit: int, metric: str) -> Tensor:
     n = q.size(0)
     k = q.size(1)

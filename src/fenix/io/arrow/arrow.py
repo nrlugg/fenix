@@ -1,9 +1,12 @@
 import os
 
+import fsspec
 import pyarrow as pa
 import pyarrow.dataset as ds
+import torch
+from torch import Tensor
 
-BATCH_SIZE: int = 2**20
+BATCH_SIZE: int = 2**18
 
 
 def from_ipc(path: str, schema: pa.Schema | None = None) -> pa.Table:
@@ -16,11 +19,11 @@ def from_ipc(path: str, schema: pa.Schema | None = None) -> pa.Table:
         return pa.ipc.open_file(source).read_all()
 
 
-def to_ipc(
-    path: str, data: pa.Table | ds.Dataset | pa.RecordBatchReader, schema: pa.Schema | None = None
-) -> None:
+def to_ipc(path: str, data: pa.Table | pa.RecordBatchReader, schema: pa.Schema) -> None:
     assert path.endswith(".arrow")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    fs = fsspec.filesystem("file")
+    fs.makedirs(os.path.dirname(path), exist_ok=True)
 
     data = data if isinstance(data, pa.RecordBatchReader) else data.to_reader(BATCH_SIZE)
 
@@ -28,3 +31,17 @@ def to_ipc(
         with pa.ipc.new_file(sink, schema) as writer:
             for batch in data:
                 writer.write_batch(batch)
+
+
+def to_torch(v: pa.FixedSizeListArray | pa.FixedSizeListScalar) -> Tensor:
+    if isinstance(v, pa.FixedSizeListScalar):
+        return torch.from_numpy(
+            v.values.to_numpy(),
+        )
+
+    if isinstance(v, pa.FixedSizeListArray):
+        return torch.from_numpy(
+            v.values.to_numpy(),
+        ).view(-1, v.type.list_size)
+
+    raise TypeError()
