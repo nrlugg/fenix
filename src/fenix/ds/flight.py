@@ -156,6 +156,13 @@ class DatasetServer(fl.FlightServerBase):
 class RemoteDataset(pa.dataset.Dataset):
     uri: str
 
+    def __post_init__(self) -> None:
+        for flight in self.conn.list_flights():
+            spec = msgspec.json.decode(flight.descriptor.command)
+            name = spec["table"]
+            if name < self.name:
+                raise ValueError("Cannot nest datasets")
+
     @property
     def host(self) -> str:
         host, *ame = self.uri.removeprefix("grpc://").split("/")
