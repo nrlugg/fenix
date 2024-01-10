@@ -16,7 +16,7 @@ from torch import Tensor
 import fenix.io as io
 import fenix.vq as vq
 
-BATCH_SIZE: int = 2**18
+BATCH_SIZE: int = 2**20
 SOURCE_ROOT: str = "source"
 CODING_ROOT: str = "coding"
 CODING_DATA: str = ".coding.torch"
