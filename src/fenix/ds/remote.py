@@ -18,17 +18,17 @@ from fenix.ds.engine import CODING_DATA, SOURCE_ROOT, CodingConfig, Engine, Sour
 class Server(fl.FlightServerBase):
     def __init__(self, root: str, host: str = "0.0.0.0", port: int = 9001) -> None:
         self.data_location = os.path.abspath(root)
-        self.grpc_location = f"grpc://{host}/{port}"
+        self.grpc_location = f"grpc://{host}:{port}"
 
         super().__init__(location=self.grpc_location)
 
-    @staticmethod
-    def source_from_descriptor(desc: fl.FlightDescriptor) -> Source:
-        return Source(join(*map(bytes.decode, desc.path)))
+    def source_from_descriptor(self, desc: fl.FlightDescriptor) -> Source:
+        return Source(join(self.data_location, *map(bytes.decode, desc.path)))
 
-    @staticmethod
-    def engine_from_descriptor(desc: fl.FlightDescriptor) -> Engine:
-        return Engine(**msgspec.json.decode(desc.command))
+    def engine_from_descriptor(self, desc: fl.FlightDescriptor) -> Engine:
+        config = msgspec.json.decode(desc.command)
+        config["source"] = join(self.data_location, config["source"])
+        return Engine(**config)
 
     def get_flight_info(
         self,
@@ -71,7 +71,7 @@ class Server(fl.FlightServerBase):
                     *(
                         path.removesuffix(SOURCE_ROOT)
                         .removesuffix("/")
-                        .removeprefix(self.grpc_location)
+                        .removeprefix(self.data_location)
                         .removeprefix("/")
                         .split("/")
                     )
@@ -82,7 +82,9 @@ class Server(fl.FlightServerBase):
             if CODING_DATA in files:
                 *source, _, column, metric, coding = path.split(os.path.sep)
 
-                source = join(*source).removeprefix(self.data_location).removeprefix("/")
+                source = "/" + join(*source)
+                source = source.removeprefix(self.data_location).removeprefix("/")
+
                 descriptor = fl.FlightDescriptor.for_command(
                     msgspec.json.encode(
                         {
@@ -111,13 +113,21 @@ class Server(fl.FlightServerBase):
         data: Source | Engine
 
         if ":" in (name := ticket.ticket.decode()):
-            name, spec = name.split(":")
+            source, spec = name.split(":")
             column, metric, coding = spec.split("/")
 
-            data = Engine(name, column, metric, coding)
+            data = self.engine_from_descriptor(
+                fl.FlightDescriptor.for_command(
+                    msgspec.json.encode(
+                        {"source": source, "column": column, "metric": metric, "coding": coding}
+                    )
+                )
+            )
 
         else:
-            data = Source(name)
+            data = self.source_from_descriptor(
+                fl.FlightDescriptor.for_path(*name.split("/")),
+            )
 
         return fl.GeneratorStream(data.schema, data.to_pyarrow().to_reader())
 
@@ -129,7 +139,12 @@ class Server(fl.FlightServerBase):
         writer: fl.MetadataRecordBatchWriter,
     ) -> None:
         config = msgspec.json.decode(descriptor.command)
-        engine = Engine(**config["engine"])
+
+        engine = self.engine_from_descriptor(
+            fl.FlightDescriptor.for_command(
+                msgspec.json.encode(config["engine"]),
+            ),
+        )
 
         if config["search"]["filter"] is not None:
             config["search"]["filter"] = pickle.loads(config["search"]["filter"])
@@ -144,7 +159,13 @@ class Server(fl.FlightServerBase):
 
     def do_action(self, ctx: fl.ServerCallContext, action: fl.Action) -> None:
         config = msgspec.json.decode(action.body.to_pybytes())
-        engine = Engine(**config["engine"])
+        engine = self.engine_from_descriptor(
+            fl.FlightDescriptor.for_command(
+                msgspec.json.encode(config["engine"]),
+            )
+        )
+
+        print(engine)
 
         match action.type:
             case "encode":
@@ -162,8 +183,13 @@ class Remote(msgspec.Struct, frozen=True, dict=True):
 
     def __post_init__(self) -> None:
         for flight in self.conn.list_flights():
-            spec = msgspec.json.decode(flight.descriptor.command)
-            name = spec["table"]
+            desc = flight.descriptor
+
+            if desc.path is not None:
+                name = join(*map(bytes.decode, desc.path))
+            else:
+                name = msgspec.json.decode(desc.command)["source"]
+
             if name < self.name:
                 raise ValueError("Cannot nest datasets")
 
