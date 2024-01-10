@@ -27,8 +27,8 @@ METRIC_NAME: str = "__DISTANCE__"
 class CodingConfig(TypedDict):
     codebook_size: int
     num_codebooks: int
-    sample_size: int
-    num_samples: int
+    num_epochs: int
+    batch_size: int
 
 
 class CodingState(TypedDict):

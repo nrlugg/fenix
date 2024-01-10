@@ -1,5 +1,3 @@
-from typing import Sequence
-
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -41,28 +39,37 @@ def update(v: Tensor, q: Tensor, metric: str) -> Tensor:
     return q
 
 
-def sample(data: pa.FixedSizeListArray, size: Sequence[int]) -> Tensor:
-    mask = np.random.permutation(len(data)) < np.prod(size)
-    data = pc.array_filter(data, mask).combine_chunks()
-    return io.arrow.to_torch(data).view(*size, -1)
-
-
 @torch.inference_mode()
 def kmeans(
     vector: pa.FixedShapeTensorArray,
     metric: str,
     codebook_size: int,
     num_codebooks: int,
-    sample_size: int,
-    num_samples: int,
+    batch_size: int,
+    num_epochs: int,
 ) -> Tensor:
     f = torch.compile(torch.vmap(update))
 
-    q = sample(vector, (num_codebooks, codebook_size))
+    q = io.arrow.to_torch(
+        pc.array_filter(
+            vector,
+            np.random.permutation(len(vector)) < codebook_size * num_codebooks,
+        ).combine_chunks()
+    ).view(num_codebooks, codebook_size, -1)
 
-    for _ in tqdm(range(num_samples)):
-        v = sample(vector, (num_codebooks, sample_size))
-        q = f(v, q, metric=metric)
+    for _ in range(num_epochs):
+        size = num_codebooks * batch_size
+        indx = np.random.permutation(len(vector))
+        indx = indx[: indx.size // size * size]
+
+        for i in tqdm(np.array_split(indx, indx.size // size)):
+            np.put(filter := np.zeros(len(vector), dtype=np.bool_), i, True)
+
+            v = io.arrow.to_torch(
+                pc.array_filter(vector, filter).combine_chunks(),
+            ).view(num_codebooks, batch_size, -1)
+
+            q = f(v, q, metric=metric)
 
     return q
 
