@@ -49,19 +49,19 @@ def sample(data: pa.FixedSizeListArray, size: Sequence[int]) -> Tensor:
 
 @torch.inference_mode()
 def kmeans(
-    x: pa.FixedShapeTensorArray,
-    k: int,
-    n: int,
+    vector: pa.FixedShapeTensorArray,
     metric: str,
+    codebook_size: int,
+    num_codebooks: int,
     sample_size: int,
     num_samples: int,
 ) -> Tensor:
     f = torch.compile(torch.vmap(update))
 
-    q = sample(x, (n, k))
+    q = sample(vector, (num_codebooks, codebook_size))
 
     for _ in tqdm(range(num_samples)):
-        v = sample(x, (n, sample_size))
+        v = sample(vector, (num_codebooks, sample_size))
         q = f(v, q, metric=metric)
 
     return q

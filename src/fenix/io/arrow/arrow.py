@@ -39,9 +39,6 @@ def to_torch(v: pa.FixedSizeListArray | pa.FixedSizeListScalar) -> Tensor:
             v.values.to_numpy(),
         )
 
-    if isinstance(v, pa.FixedSizeListArray):
-        return torch.from_numpy(
-            v.values.to_numpy(),
-        ).view(-1, v.type.list_size)
-
-    raise TypeError()
+    return torch.from_numpy(
+        v.values.to_numpy(),
+    ).view(-1, v.type.list_size)
