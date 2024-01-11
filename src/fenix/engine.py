@@ -124,12 +124,20 @@ class Engine(Source, frozen=True, dict=True):
         except AssertionError:
             pass
 
-    def to_pyarrow(self) -> pa.Table:
+    def to_pyarrow(
+        self, select: Sequence[str] | None = None, filter: pc.Expression | None = None
+    ) -> pa.Table:
         t = super().to_pyarrow()
 
         if self.coding is not None:
             i = io.arrow.from_ipc(self.coding_path)
             t = t.append_column(CODING_NAME, i.column(CODING_NAME))
+
+        if filter is not None:
+            t = t.filter(filter)
+
+        if select is not None:
+            t = t.select(select)
 
         return t
 
