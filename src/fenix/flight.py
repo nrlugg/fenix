@@ -12,7 +12,7 @@ import pyarrow.compute as pc
 import pyarrow.flight as fl
 from torch import Tensor
 
-from fenix.ds.engine import CODING_DATA, SOURCE_ROOT, CodingConfig, Engine, Source
+from fenix.engine import CODING_DATA, SOURCE_ROOT, CodingConfig, Engine, Source
 
 
 class Server(fl.FlightServerBase):
@@ -129,7 +129,17 @@ class Server(fl.FlightServerBase):
                 fl.FlightDescriptor.for_path(*name.split("/")),
             )
 
-        return fl.GeneratorStream(data.schema, data.to_pyarrow().to_reader())
+        table = data.to_pyarrow()
+
+        if hasattr(self, "filter"):
+            table = table.filter(self.filter)
+            del self.filter
+
+        if hasattr(self, "select"):
+            table = table.select(self.select)
+            del self.select
+
+        return fl.GeneratorStream(data.schema, table.to_reader())
 
     def do_exchange(
         self,
@@ -158,24 +168,36 @@ class Server(fl.FlightServerBase):
         writer.write_table(result)
 
     def do_action(self, ctx: fl.ServerCallContext, action: fl.Action) -> None:
-        config = msgspec.json.decode(action.body.to_pybytes())
-        engine = self.engine_from_descriptor(
-            fl.FlightDescriptor.for_command(
-                msgspec.json.encode(config["engine"]),
-            )
-        )
-
-        print(engine)
-
         match action.type:
             case "encode":
+                config = msgspec.json.decode(action.body.to_pybytes())
+                engine = self.engine_from_descriptor(
+                    fl.FlightDescriptor.for_command(
+                        msgspec.json.encode(config["engine"]),
+                    )
+                )
+
                 engine.encode(**config["encode"])
+
+            case "set-filter":
+                self.filter = pickle.loads(action.body.to_pybytes())
+
+            case "del-filter":
+                if hasattr(self, "filter"):
+                    del self.filter
+
+            case "set-select":
+                self.select = pickle.loads(action.body.to_pybytes())
+
+            case "del-select":
+                if hasattr(self, "select"):
+                    del self.select
 
             case _:
                 raise ValueError()
 
 
-class Remote(msgspec.Struct, frozen=True, dict=True):
+class Flight(msgspec.Struct, frozen=True, dict=True):
     source: str
     column: str
     metric: str
@@ -209,13 +231,29 @@ class Remote(msgspec.Struct, frozen=True, dict=True):
     def __del__(self) -> None:
         self.conn.close()
 
-    def to_pyarrow(self) -> pa.RecordBatchReader:
-        ticket = self.name
+    def to_pyarrow(
+        self, select: Sequence[str] | None = None, filter: pc.Expression | None = None
+    ) -> pa.Table:
+        if select is not None:
+            action = fl.Action("set-select", pickle.dumps(select))
+            self.conn.do_action(action)
 
+        if filter is not None:
+            action = fl.Action("set-filter", pickle.dumps(filter))
+            self.conn.do_action(action)
+
+        name = self.name
         if self.coding is not None:
-            ticket = f"{ticket}:{self.column}/{self.metric}/{self.coding}"
+            name = f"{name}:{self.column}/{self.metric}/{self.coding}"
 
-        return self.conn.do_get(fl.Ticket(ticket)).to_reader()
+        ticket = fl.Ticket(name)
+
+        table = self.conn.do_get(ticket).read_all()
+
+        self.conn.do_action(fl.Action("del-select", b""))
+        self.conn.do_action(fl.Action("del-filter", b""))
+
+        return table
 
     def insert(self, data: pa.Table | pa.RecordBatchReader) -> Self:
         data = data if isinstance(data, pa.RecordBatchReader) else data.to_reader()
@@ -273,7 +311,7 @@ class Remote(msgspec.Struct, frozen=True, dict=True):
 
             return reader.read_all()
 
-    def encode(self, name: str, config: CodingConfig) -> "Remote":
+    def encode(self, name: str, config: CodingConfig) -> "Flight":
         action = fl.Action(
             "encode",
             msgspec.json.encode(
@@ -293,4 +331,4 @@ class Remote(msgspec.Struct, frozen=True, dict=True):
 
         self.conn.do_action(action)
 
-        return Remote(self.source, self.column, self.metric, name)
+        return Flight(self.source, self.column, self.metric, name)
