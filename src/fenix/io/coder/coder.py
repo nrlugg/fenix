@@ -18,7 +18,7 @@ import fenix.io.torch
 warnings.simplefilter("ignore", UserWarning)
 
 
-LOCATION: str = "indexes"
+LOCATION: str = "codings"
 
 
 class Config(TypedDict):
@@ -72,7 +72,6 @@ def load(root: str, name: str) -> Coding:
         data: Coding = torch.load(f, map_location="cpu")
 
     column = data["column"]
-    metric = data["config"]["metric"]
 
     if name not in pc.list_functions():
 
@@ -85,34 +84,6 @@ def load(root: str, name: str) -> Coding:
             {"summary": "", "description": ""},
             {"x": column, "k": pa.int64()},
             pa.list_(pa.int64()),
-        )
-
-    name = f"distance:{metric}:{column.value_type}:{column.list_size}"
-
-    if name not in pc.list_functions():
-
-        def dist(
-            ctx: pc.UdfContext, x: pa.FixedSizeListArray, q: pa.FixedSizeListScalar
-        ) -> pa.FloatArray:
-            return pa.array(
-                (
-                    distance(
-                        fenix.io.torch.from_arrow(q).unsqueeze(0),
-                        fenix.io.torch.from_arrow(x),
-                        metric=metric,
-                    )
-                    .squeeze(0)
-                    .numpy()
-                ),
-                type=column.value_type,
-            )
-
-        pc.register_scalar_function(
-            dist,
-            name,
-            {"summary": "", "description": ""},
-            {"x": column, "q": column},
-            column.value_type,
         )
 
     return data
@@ -158,6 +129,13 @@ def list(root: str) -> Iterator[str]:
     for path in fsspec.get_mapper(os.path.join(root, LOCATION)):
         if path.endswith(".torch"):
             yield path.removesuffix(".torch")
+
+
+def drop(root: str, name: str) -> None:
+    path = os.path.join(root, LOCATION, name + ".torch")
+
+    if os.path.exists(path):
+        os.unlink(path)
 
 
 def call(

@@ -1,1 +1,1 @@
-from .table import join, load, make
+from .table import drop, join, list, load, make

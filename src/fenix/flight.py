@@ -87,6 +87,19 @@ class Server(fl.FlightServerBase):
             case "make-index":
                 io.index.make(self.root, **config)
 
+            case "drop-table":
+                io.table.drop(self.root, **config)
+
+            case "drop-index":
+                io.coder.drop(self.root, **config)
+
+                for path in io.index.list(self.root):
+                    path = os.path.basename(path)
+
+                    if path.endswith(config["name"]):
+                        *_, data, column, name = path.split("/")
+                        io.index.drop(self.root, name, data, column)
+
             case "set-coding":
                 self.coding = config["coding"]
 
@@ -142,17 +155,17 @@ class Flight:
 
         return self
 
-    def load_table(
+    def read_table(
         self,
-        *names: str,
+        source: str | Sequence[str],
         coding: str | None = None,
         column: str | None = None,
         select: Sequence[str] | None = None,
         filter: pc.Expression | None = None,
     ) -> pa.RecordBatchReader:
         if coding is not None and column is not None:
-            self.conn.do_action(fl.Action("set-coding", bytes()))
-            self.conn.do_action(fl.Action("set-column", bytes()))
+            self.conn.do_action(fl.Action("set-coding", pickle.dumps({"coding": coding})))
+            self.conn.do_action(fl.Action("set-column", pickle.dumps({"column": column})))
 
         if select is not None:
             self.conn.do_action(
@@ -164,14 +177,23 @@ class Flight:
                 fl.Action("set-filter", pickle.dumps({"filter": filter})),
             )
 
-        reader = self.conn.do_get(fl.Ticket(":".join(names))).to_reader()
+        source = ":".join(source) if not isinstance(source, str) else source
+        ticket = fl.Ticket(source)
+        reader = self.conn.do_get(ticket).to_reader()
 
-        self.conn.do_action(fl.Action("del-coding", bytes()))
-        self.conn.do_action(fl.Action("del-column", bytes()))
-        self.conn.do_action(fl.Action("del-select", bytes()))
-        self.conn.do_action(fl.Action("del-filter", bytes()))
+        self.conn.do_action(fl.Action("del-coding", pickle.dumps({})))
+        self.conn.do_action(fl.Action("del-column", pickle.dumps({})))
+        self.conn.do_action(fl.Action("del-select", pickle.dumps({})))
+        self.conn.do_action(fl.Action("del-filter", pickle.dumps({})))
 
         return reader
+
+    def drop_table(self, name: str) -> Self:
+        self.conn.do_action(
+            fl.Action("drop-table", pickle.dumps({"name": name})),
+        )
+
+        return self
 
     def make_index(
         self, name: str, data: str | list[str], column: str, config: io.coder.Config
@@ -208,10 +230,17 @@ class Flight:
 
         return self
 
+    def drop_index(self, name: str) -> Self:
+        self.conn.do_action(
+            fl.Action("drop-index", pickle.dumps({"name": name})),
+        )
+
+        return self
+
     def search(
         self,
-        source: str | list[str],
         target: pa.Array | pa.ChunkedArray | pa.FixedSizeListScalar | np.ndarray | Tensor,
+        source: str | list[str],
         column: str,
         metric: str,
         select: Sequence[str] | None = None,

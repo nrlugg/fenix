@@ -20,7 +20,7 @@ def load(root: str, name: str, data: str | Sequence[str], column: str) -> pa.Tab
     if isinstance(data, str):
         fenix.io.coder.load(root, name)
 
-        path = os.path.join(root, LOCATION, name, data, column + ".arrow")
+        path = os.path.join(root, LOCATION, data, column, name + ".arrow")
 
         return fenix.io.table.join(
             fenix.io.table.load(root, data),
@@ -36,7 +36,7 @@ def load(root: str, name: str, data: str | Sequence[str], column: str) -> pa.Tab
 
 def make(root: str, name: str, data: str | Sequence[str], column: str) -> pa.Table:
     if isinstance(data, str):
-        path = os.path.join(root, LOCATION, name, data, column + ".arrow")
+        path = os.path.join(root, LOCATION, data, column, name + ".arrow")
 
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -69,6 +69,13 @@ def list(root: str) -> Iterator[str]:
     for path in fsspec.get_mapper(os.path.join(root, LOCATION)):
         if path.endswith(".arrow"):
             yield path.removesuffix(".arrow")
+
+
+def drop(root: str, name: str, data: str, column: str) -> None:
+    path = os.path.join(root, LOCATION, data, column, name + ".arrow")
+
+    if os.path.exists(path):
+        os.unlink(path)
 
 
 def call(
@@ -125,11 +132,39 @@ def call(
 
     func = f"distance:{metric}:{type.value_type}:{type.list_size}"
 
+    if func not in pc.list_functions():
+
+        def dist(
+            ctx: pc.UdfContext, x: pa.FixedSizeListArray, q: pa.FixedSizeListScalar
+        ) -> pa.FloatArray:
+            return pa.array(
+                (
+                    fenix.io.coder.distance(
+                        fenix.io.torch.from_arrow(q).unsqueeze(0),
+                        fenix.io.torch.from_arrow(x),
+                        metric=metric,
+                    )
+                    .squeeze(0)
+                    .numpy()
+                ),
+                type=type.value_type,
+            )
+
+        pc.register_scalar_function(
+            dist,
+            func,
+            {"summary": "", "description": ""},
+            {"x": type, "q": type},
+            type.value_type,
+        )
+
     data = data.filter(filter) if filter is not None else data
     data = data.append_column(DIST_COL, pc.call_function(func, [data.column(column), target]))
     data = data.select(select)
-    data = data.take(
-        pc.select_k_unstable(data, maxval, [(DIST_COL, "ascending")]),
-    )
 
-    return data
+    if maxval is not None and len(data) > maxval:
+        data = data.take(
+            pc.select_k_unstable(data, maxval, [(DIST_COL, "ascending")]),
+        )
+
+    return data.combine_chunks()
