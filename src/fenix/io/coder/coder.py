@@ -21,7 +21,6 @@ LOCATION: str = "indexes"
 
 
 class Config(TypedDict):
-    column: pa.DataType
     metric: str
     codebook_size: int
     num_codebooks: int
@@ -31,6 +30,7 @@ class Config(TypedDict):
 
 class Coding(TypedDict):
     tensor: Tensor
+    column: pa.DataType
     config: Config
 
 
@@ -70,7 +70,7 @@ def load(root: str, name: str) -> Coding:
     with open(path, "rb") as f:
         data: Coding = torch.load(f, map_location="cpu")
 
-    column = data["config"]["column"]
+    column = data["column"]
     metric = data["config"]["metric"]
 
     if name not in pc.list_functions():
@@ -148,7 +148,7 @@ def make(root: str, name: str, data: str | list[str], column: str, config: Confi
     os.makedirs(os.path.dirname(path), exist_ok=False)
 
     with open(path, "wb") as f:
-        torch.save({"tensor": coding, "config": config}, f)
+        torch.save({"tensor": coding, "column": source.column(column).type, "config": config}, f)
 
     return load(root, name)
 
@@ -165,7 +165,7 @@ def call(
 
     n = code["config"]["num_codebooks"]
     k = code["config"]["codebook_size"]
-    column = code["config"]["column"]
+    column = code["column"]
     metric = code["config"]["metric"]
     coding = code["tensor"]
 
