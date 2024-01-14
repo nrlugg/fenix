@@ -219,7 +219,7 @@ class Flight(msgspec.Struct, frozen=True, dict=True):
         METRICS: set[str] = {"cosine", "dot", "l2"}
 
         descriptor = fl.FlightDescriptor.for_command(
-            msgspec.json.encode(
+            pickle.dumps(
                 {
                     "name": None if metric in METRICS else metric,
                     "data": source,
@@ -239,7 +239,7 @@ class Flight(msgspec.Struct, frozen=True, dict=True):
         if isinstance(target, np.ndarray):
             target = pa.array(target)
 
-        target = pa.table({"vector": target})
+        target = pa.table({"target": target})
 
         writer, reader = self.conn.do_exchange(descriptor)
 

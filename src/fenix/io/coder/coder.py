@@ -11,7 +11,7 @@ from torch import Tensor
 import fenix.io.table
 import fenix.io.torch
 
-LOCATION: str = "codings"
+LOCATION: str = "indexes"
 
 
 class Config(TypedDict):

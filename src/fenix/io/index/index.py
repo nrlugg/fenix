@@ -52,7 +52,7 @@ def make(root: str, name: str, data: str | list[str], column: str) -> pa.Table:
     code = pc.call_function(name, [code, pa.scalar(1)])
     code = pc.list_element(code, 0)
     code = pa.table({CODE_COL: code})
-    code = fenix.io.arrow.make(path, code)
+    code = fenix.io.arrow.make(path, code.to_reader())
 
     return load(root, name, data, column)
 
@@ -75,7 +75,7 @@ def call(
         else:
             data = fenix.io.table.load(root, data)
 
-    source = data.column(column)
+    type = data.schema.field(column).type
 
     if isinstance(target, pa.ChunkedArray):
         target = target.combine_chunks()
@@ -109,10 +109,10 @@ def call(
 
     assert metric is not None
 
-    func = f"distance:{metric}:{source.type.value_type}:{source.type.list_size}"
+    func = f"distance:{metric}:{type.value_type}:{type.list_size}"
 
     data = data.filter(filter) if filter is not None else data
-    data = data.append_column(DIST_COL, pc.call_function(func, [source, target]))
+    data = data.append_column(DIST_COL, pc.call_function(func, [data.column(column), target]))
     data = data.select(select)
     data = data.take(
         pc.select_k_unstable(data, maxval, [(DIST_COL, "ascending")]),
