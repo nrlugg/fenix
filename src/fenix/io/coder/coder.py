@@ -1,7 +1,8 @@
 import os
 import warnings
-from typing import TypedDict
+from typing import Iterator, Sequence, TypedDict
 
+import fsspec
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -117,7 +118,7 @@ def load(root: str, name: str) -> Coding:
     return data
 
 
-def make(root: str, name: str, data: str | list[str], column: str, config: Config) -> Coding:
+def make(root: str, name: str, data: str | Sequence[str], column: str, config: Config) -> Coding:
     update = torch.compile(torch.vmap(kmeans))
     source = fenix.io.table.load(root, data)
 
@@ -145,12 +146,18 @@ def make(root: str, name: str, data: str | list[str], column: str, config: Confi
 
     path = os.path.join(root, LOCATION, name + ".torch")
 
-    os.makedirs(os.path.dirname(path), exist_ok=False)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
 
     with open(path, "wb") as f:
         torch.save({"tensor": coding, "column": source.column(column).type, "config": config}, f)
 
     return load(root, name)
+
+
+def list(root: str) -> Iterator[str]:
+    for path in fsspec.get_mapper(os.path.join(root, LOCATION)):
+        if path.endswith(".torch"):
+            yield path.removesuffix(".torch")
 
 
 def call(

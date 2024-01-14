@@ -1,6 +1,7 @@
 import os
-from typing import Sequence
+from typing import Iterator, Sequence
 
+import fsspec
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -15,52 +16,65 @@ DIST_COL: str = "__DISTANCE__"
 LOCATION: str = "indexes"
 
 
-def load(root: str, name: str, data: str | list[str], column: str) -> pa.Table:
-    if isinstance(data, list):
+def load(root: str, name: str, data: str | Sequence[str], column: str) -> pa.Table:
+    if isinstance(data, str):
+        fenix.io.coder.load(root, name)
+
+        path = os.path.join(root, LOCATION, name, data, column + ".arrow")
+
         return fenix.io.table.join(
-            *[load(root, name, data, column) for data in data],
+            fenix.io.table.load(root, data),
+            fenix.io.arrow.load(path),
+            axis=1,
         )
 
-    assert isinstance(data, str)
-
-    fenix.io.coder.load(root, name)
-
-    path = os.path.join(root, LOCATION, name, data, column + ".arrow")
-
+    assert isinstance(data, Sequence) and not isinstance(data, str)
     return fenix.io.table.join(
-        fenix.io.table.load(root, data),
-        fenix.io.arrow.load(path),
-        axis=1,
+        *[load(root, name, data, column) for data in data],
     )
 
 
-def make(root: str, name: str, data: str | list[str], column: str) -> pa.Table:
-    if isinstance(data, list):
-        return fenix.io.table.join(
-            *[make(root, name, data, column) for data in data],
+def make(root: str, name: str, data: str | Sequence[str], column: str) -> pa.Table:
+    if isinstance(data, str):
+        path = os.path.join(root, LOCATION, name, data, column + ".arrow")
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        fenix.io.coder.load(root, name)
+
+        def record_batch_generator() -> Iterator[pa.RecordBatch]:
+            for code in fenix.io.table.load(root, data).to_reader():
+                code = code.column(column)
+                code = pc.call_function(name, [code, pa.scalar(1)])
+                code = pc.list_element(code, 0)
+                yield pa.record_batch([code], names=[CODE_COL])
+
+        fenix.io.arrow.make(
+            path,
+            pa.RecordBatchReader.from_batches(
+                pa.schema({CODE_COL: pa.int64()}),
+                record_batch_generator(),
+            ),
         )
 
-    assert isinstance(data, str)
+        return load(root, name, data, column)
 
-    path = os.path.join(root, LOCATION, name, data, column + ".arrow")
+    assert isinstance(data, Sequence) and not isinstance(data, str)
+    return fenix.io.table.join(
+        *[make(root, name, data, column) for data in data],
+    )
 
-    os.makedirs(os.path.dirname(path), exist_ok=False)
 
-    fenix.io.coder.load(root, name)
-
-    code = fenix.io.table.load(root, data).column(column)
-    code = pc.call_function(name, [code, pa.scalar(1)])
-    code = pc.list_element(code, 0)
-    code = pa.table({CODE_COL: code})
-    code = fenix.io.arrow.make(path, code.to_reader())
-
-    return load(root, name, data, column)
+def list(root: str) -> Iterator[str]:
+    for path in fsspec.get_mapper(os.path.join(root, LOCATION)):
+        if path.endswith(".arrow"):
+            yield path.removesuffix(".arrow")
 
 
 def call(
     root: str,
     name: str | None,
-    data: str | list[str] | pa.Table,
+    data: str | Sequence[str] | pa.Table,
     column: str,
     target: pa.Array | pa.ChunkedArray | pa.FixedSizeListScalar | np.ndarray | Tensor,
     metric: str | None = None,
@@ -104,7 +118,7 @@ def call(
         else:
             filter = filter & mask
 
-    select = list(select) if select is not None else data.column_names
+    select = [*select] if select is not None else data.column_names
     select = select + [DIST_COL]
 
     assert metric is not None

@@ -1,5 +1,5 @@
 import os
-from typing import Literal
+from typing import Literal, Sequence
 
 import pyarrow as pa
 
@@ -8,15 +8,16 @@ import fenix.io.arrow
 LOCATION: str = "sources"
 
 
-def load(root: str, name: str | list[str]) -> pa.Table:
-    if isinstance(name, list):
-        return join(
-            *[load(root, name) for name in name],
-        )
+def load(root: str, name: str | Sequence[str]) -> pa.Table:
+    if isinstance(name, str):
+        path = os.path.join(root, LOCATION, name + ".arrow")
 
-    path = os.path.join(root, LOCATION, name + ".arrow")
+        return fenix.io.arrow.load(path)
 
-    return fenix.io.arrow.load(path)
+    assert isinstance(name, Sequence) and not isinstance(name, str)
+    return join(
+        *[load(root, name) for name in name],
+    )
 
 
 def make(root: str, name: str, data: pa.RecordBatchReader) -> pa.Table:
