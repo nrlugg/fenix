@@ -148,7 +148,7 @@ class Flight(msgspec.Struct, frozen=True, dict=True):
         column: str | None = None,
         select: Sequence[str] | None = None,
         filter: pc.Expression | None = None,
-    ) -> pa.Table:
+    ) -> pa.RecordBatchReader:
         if coding is not None and column is not None:
             self.conn.do_action(fl.Action("set-coding", bytes()))
             self.conn.do_action(fl.Action("set-column", bytes()))
@@ -159,18 +159,20 @@ class Flight(msgspec.Struct, frozen=True, dict=True):
             )
 
         if filter is not None:
-            self.conn.do_action(fl.Action("set-filter", pickle.dumps({"filter": filter})))
+            self.conn.do_action(
+                fl.Action("set-filter", pickle.dumps({"filter": filter})),
+            )
 
-        data = self.conn.do_get(fl.Ticket(":".join(names))).read_all()
+        reader = self.conn.do_get(fl.Ticket(":".join(names))).to_reader()
 
         self.conn.do_action(fl.Action("del-coding", bytes()))
         self.conn.do_action(fl.Action("del-column", bytes()))
         self.conn.do_action(fl.Action("del-select", bytes()))
         self.conn.do_action(fl.Action("del-filter", bytes()))
 
-        return data
+        return reader
 
-    def make_coder(
+    def make_index(
         self, name: str, data: str | list[str], column: str, config: io.coder.Config
     ) -> Self:
         self.conn.do_action(
@@ -187,9 +189,9 @@ class Flight(msgspec.Struct, frozen=True, dict=True):
             )
         )
 
-        return self.make_index(name, data, column)
+        return self.sync_index(name, data, column)
 
-    def make_index(self, name: str, data: str | list[str], column: str) -> Self:
+    def sync_index(self, name: str, data: str | list[str], column: str) -> Self:
         self.conn.do_action(
             fl.Action(
                 "make-index",
