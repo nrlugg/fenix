@@ -6,6 +6,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import torch
 import torch.nn.functional as F
+from rich.progress import track
 from torch import Tensor
 
 import fenix.io.table
@@ -127,7 +128,7 @@ def make(root: str, name: str, data: str | list[str], column: str, config: Confi
         batch_rows = np.random.permutation(len(vector))
         batch_rows = batch_rows[: batch_rows.size // batch_size * batch_size]
 
-        for rowids in np.array_split(batch_rows, batch_rows.size // batch_size):
+        for rowids in track(np.array_split(batch_rows, batch_rows.size // batch_size)):
             np.put(filter := np.zeros(len(vector), dtype=np.bool_), rowids, True)
 
             sample = fenix.io.torch.from_arrow(
