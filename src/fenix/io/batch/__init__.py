@@ -1,1 +1,1 @@
-from .batch import map
+from .batch import imap

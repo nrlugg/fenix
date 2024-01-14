@@ -1,30 +1,46 @@
-from typing import Callable, Iterable, Iterator, TypeVar
+from typing import Callable, Iterator, TypeVar
 
-import multiprocess as mp
+import numpy as np
 import psutil
+import pyarrow as pa
+from pydantic.dataclasses import dataclass
+from torch.utils.data import DataLoader, IterableDataset
+
+import fenix.io.table
 
 X = TypeVar("X")
 Y = TypeVar("Y")
 
 
-def map(
-    func: Callable[[X], Y],
-    iter: Iterable[X],
-    *,
-    num_workers: int | None = None,
-    buffer_size: int = 1,
-) -> Iterator[Y]:
-    num_workers = num_workers if num_workers is not None else psutil.cpu_count(logical=False)
+@dataclass(frozen=True)
+class RandomBatchIterator(IterableDataset):
+    root: str
+    name: str | list[str]
+    size: int
 
-    with mp.Manager() as manager:
-        semaphore = manager.Semaphore(num_workers * buffer_size)
+    def __iter__(self) -> Iterator[pa.RecordBatch]:
+        table = fenix.io.table.load(self.root, self.name)
 
-        def iterator() -> Iterator[X]:
-            for item in iter:
-                semaphore.acquire()
-                yield item
+        index = np.random.permutation(table.num_rows)
+        index = index[: table.num_rows // self.size * self.size]
 
-        with mp.Pool(num_workers) as pool:
-            for item in pool.imap_unordered(func, iterator()):
-                yield item
-                semaphore.release()
+        for rowids in np.array_split(index, index.size // self.size):
+            filter = np.zeros(table.num_rows, dtype=np.bool_)
+            np.put(filter, rowids, True)
+
+            yield table.filter(filter)
+
+
+def imap(
+    root: str,
+    name: str | list[str],
+    size: int,
+    func: Callable[[pa.RecordBatch], pa.RecordBatch] | None = None,
+) -> Iterator[pa.RecordBatch]:
+    yield from DataLoader(
+        RandomBatchIterator(root, name, size),
+        batch_size=None,
+        shuffle=False,
+        num_workers=psutil.cpu_count(logical=False),
+        collate_fn=func,
+    )

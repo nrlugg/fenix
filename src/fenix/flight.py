@@ -3,11 +3,11 @@ import os
 import pickle
 from typing import Iterator, Self, Sequence
 
-import msgspec
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.flight as fl
+from pydantic.dataclasses import dataclass
 from torch import Tensor
 
 import fenix.io as io
@@ -119,7 +119,8 @@ class Server(fl.FlightServerBase):
                 raise ValueError()
 
 
-class Flight(msgspec.Struct, frozen=True, dict=True):
+@dataclass(frozen=True)
+class Flight:
     host: str = "0.0.0.0"
     port: int = 9001
 
