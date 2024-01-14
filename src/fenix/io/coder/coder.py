@@ -1,4 +1,5 @@
 import os
+import warnings
 from typing import TypedDict
 
 import numpy as np
@@ -9,8 +10,12 @@ import torch.nn.functional as F
 from torch import Tensor
 from tqdm import tqdm
 
+import fenix.io.batch
 import fenix.io.table
 import fenix.io.torch
+
+warnings.simplefilter("ignore", UserWarning)
+
 
 LOCATION: str = "indexes"
 
@@ -114,25 +119,26 @@ def load(root: str, name: str) -> Coding:
 
 def make(root: str, name: str, data: str | list[str], column: str, config: Config) -> Coding:
     update = torch.compile(torch.vmap(kmeans))
-    vector = fenix.io.table.load(root, data).column(column)
+    source = fenix.io.table.load(root, data)
+
+    filter = (
+        np.random.permutation(source.num_rows) < config["codebook_size"] * config["num_codebooks"]
+    )
 
     coding = fenix.io.torch.from_arrow(
-        pc.array_filter(
-            vector,
-            np.random.permutation(len(vector)) < config["codebook_size"] * config["num_codebooks"],
-        ).combine_chunks()
+        source.filter(filter).column(column).combine_chunks(),
     ).view(config["num_codebooks"], config["codebook_size"], -1)
 
     for _ in range(config["num_epochs"]):
         batch_size = config["num_codebooks"] * config["batch_size"]
-        batch_rows = np.random.permutation(len(vector))
+        batch_rows = np.random.permutation(source.num_rows)
         batch_rows = batch_rows[: batch_rows.size // batch_size * batch_size]
 
-        for rowids in tqdm(np.array_split(batch_rows, batch_rows.size // batch_size)):
-            np.put(filter := np.zeros(len(vector), dtype=np.bool_), rowids, True)
+        for indices in tqdm(np.array_split(batch_rows, batch_rows.size // batch_size)):
+            np.put(filter := np.zeros(source.num_rows, dtype=np.bool_), indices, True)
 
             sample = fenix.io.torch.from_arrow(
-                pc.array_filter(vector, filter).combine_chunks()
+                source.filter(filter).column(column).combine_chunks()
             ).view(config["num_codebooks"], config["batch_size"], -1)
 
             coding = update(coding, sample, metric=config["metric"])
