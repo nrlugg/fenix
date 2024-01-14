@@ -17,6 +17,7 @@ dependencies = [
     "pyarrow>=14.0.2",
     "xxhash>=3.4.1",
     "pydantic>=2.5.3",
+    "tqdm>=4.66.1",
 ]
 
 [tool.pdm.dev-dependencies]
