@@ -12,7 +12,7 @@ LOGGER.setLevel(level=logging.INFO)
 def launch(root: str, host: str = "0.0.0.0", port: int = 9001):
     server = Server(root, host, port)
 
-    LOGGER.info(f" Server started at {server.grpc_location}")
+    LOGGER.info(f" Server started at {server.grpc}")
 
     server.serve()
 

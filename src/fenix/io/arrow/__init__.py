@@ -1,1 +1,1 @@
-from .arrow import from_ipc, to_ipc, to_torch
+from .arrow import load, make

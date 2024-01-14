@@ -15,8 +15,11 @@ dependencies = [
     "numpy>=1.25.2",
     "torch>=2.1.2",
     "pyarrow>=14.0.2",
-    "msgspec>=0.18.4",
     "xxhash>=3.4.1",
+    "fsspec>=2023.12.2",
+    "pydantic>=2.5.3",
+    "tqdm>=4.66.1",
+    "typer>=0.9.0",
 ]
 
 [tool.pdm.dev-dependencies]
