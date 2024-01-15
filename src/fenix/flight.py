@@ -196,7 +196,7 @@ class Flight:
         return self
 
     def make_index(
-        self, name: str, data: str | list[str], column: str, config: io.coder.Config
+        self, name: str, data: str | Sequence[str], column: str, config: io.coder.Config
     ) -> Self:
         self.conn.do_action(
             fl.Action(
@@ -214,7 +214,7 @@ class Flight:
 
         return self.sync_index(name, data, column)
 
-    def sync_index(self, name: str, data: str | list[str], column: str) -> Self:
+    def sync_index(self, name: str, data: str | Sequence[str], column: str) -> Self:
         self.conn.do_action(
             fl.Action(
                 "make-index",
@@ -240,7 +240,7 @@ class Flight:
     def search(
         self,
         target: pa.Array | pa.ChunkedArray | pa.FixedSizeListScalar | np.ndarray | Tensor,
-        source: str | list[str],
+        source: str | Sequence[str],
         column: str,
         metric: str,
         select: Sequence[str] | None = None,
