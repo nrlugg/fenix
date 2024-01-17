@@ -28,9 +28,10 @@ dev = [
     "ruff>=0.1.6",
     "isort>=5.12.0",
     "black>=23.10.0",
+    "pytest>=7.4.4",
     "jupyterlab>=4.0.7",
     "duckdb>=0.9.2",
-    "ibis-framework[duckdb]>=7.2.0"
+    "ibis-framework[duckdb]>=7.2.0",
 ]
 
 
@@ -67,6 +68,11 @@ max-complexity = 5
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
+filterwarnings = [
+    "error",
+    "ignore::UserWarning",
+]
+
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "serial",
