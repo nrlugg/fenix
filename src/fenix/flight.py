@@ -1,6 +1,7 @@
 import functools
 import os
 import pickle
+import shutil
 from typing import Iterator, Self, Sequence
 
 import numpy as np
@@ -97,6 +98,9 @@ class Server(fl.FlightServerBase):
                     if path.endswith(config["name"]):
                         *_, source, column, coding = path.split("/")
                         io.index.drop(self.root, coding, source, column)
+
+            case "remove":
+                shutil.rmtree(self.root)
 
             case "set-coding":
                 self.coding = config["coding"]
@@ -282,3 +286,7 @@ class Flight:
             writer.done_writing()
 
             return reader.read_all()
+
+    def remove(self) -> Self:
+        self.conn.do_action(fl.Action("remove", bytes()))
+        return self
