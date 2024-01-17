@@ -43,12 +43,12 @@ class Server(fl.FlightServerBase):
         io.table.make(self.root, name, data)
 
     def do_get(self, ctx: fl.ServerCallContext, ticket: fl.Ticket):
-        name = ticket.ticket.decode().split(":")
+        source = ticket.ticket.decode().split(":")
 
         if hasattr(self, "coding") and hasattr(self, "column"):
-            data = io.index.load(self.root, self.coding, name, self.column)
+            data = io.index.load(self.root, self.coding, source, self.column)
         else:
-            data = io.table.load(self.root, name)
+            data = io.table.load(self.root, source)
 
         if hasattr(self, "filter"):
             data = data.filter(self.filter)
@@ -67,12 +67,10 @@ class Server(fl.FlightServerBase):
     ) -> None:
         config = pickle.loads(descriptor.command)
 
-        if config["filter"] is not None:
-            config["filter"] = pickle.loads(config["filter"])
+        config["target"] = reader.read_all().column("target").combine_chunks()
+        config["filter"] = pickle.loads(config["filter"])
 
-        data = io.index.call(
-            self.root, **config, target=reader.read_all().column("target").combine_chunks()
-        )
+        data = io.index.call(self.root, **config)
 
         writer.begin(data.schema)
         writer.write_table(data)
@@ -97,8 +95,8 @@ class Server(fl.FlightServerBase):
                     path = os.path.basename(path)
 
                     if path.endswith(config["name"]):
-                        *_, data, column, name = path.split("/")
-                        io.index.drop(self.root, name, data, column)
+                        *_, source, column, coding = path.split("/")
+                        io.index.drop(self.root, coding, source, column)
 
             case "set-coding":
                 self.coding = config["coding"]
@@ -196,7 +194,7 @@ class Flight:
         return self
 
     def make_index(
-        self, name: str, data: str | Sequence[str], column: str, config: io.coder.Config
+        self, name: str, source: str | Sequence[str], column: str, config: io.coder.Config
     ) -> Self:
         self.conn.do_action(
             fl.Action(
@@ -204,7 +202,7 @@ class Flight:
                 pickle.dumps(
                     {
                         "name": name,
-                        "data": data,
+                        "source": source,
                         "column": column,
                         "config": config,
                     }
@@ -212,16 +210,16 @@ class Flight:
             )
         )
 
-        return self.sync_index(name, data, column)
+        return self.sync_index(name, source, column)
 
-    def sync_index(self, name: str, data: str | Sequence[str], column: str) -> Self:
+    def sync_index(self, name: str, source: str | Sequence[str], column: str) -> Self:
         self.conn.do_action(
             fl.Action(
                 "make-index",
                 pickle.dumps(
                     {
                         "name": name,
-                        "data": data,
+                        "source": source,
                         "column": column,
                     }
                 ),
@@ -243,22 +241,25 @@ class Flight:
         source: str | Sequence[str],
         column: str,
         metric: str,
+        coding: str | None = None,
         select: Sequence[str] | None = None,
         filter: pc.Expression | None = None,
         maxval: int | None = None,
         probes: int | None = None,
     ) -> pa.Table:
-        METRICS: set[str] = {"cosine", "dot", "l2"}
+        METRICS: set[str] = {"cosine", "dot", "inner_product", "l2", "euclidean"}
+
+        assert metric in METRICS
 
         descriptor = fl.FlightDescriptor.for_command(
             pickle.dumps(
                 {
-                    "name": None if metric in METRICS else metric,
-                    "data": source,
+                    "coding": coding,
+                    "source": source,
                     "column": column,
-                    "metric": metric if metric in METRICS else None,
+                    "metric": metric,
                     "select": select,
-                    "filter": pickle.dumps(filter) if filter is not None else None,
+                    "filter": pickle.dumps(filter),
                     "maxval": maxval,
                     "probes": probes,
                 }

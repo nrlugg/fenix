@@ -16,34 +16,34 @@ DIST_COL: str = "__DISTANCE__"
 LOCATION: str = "indexes"
 
 
-def load(root: str, name: str, data: str | Sequence[str], column: str) -> pa.Table:
-    if isinstance(data, str):
+def load(root: str, name: str, source: str | Sequence[str], column: str) -> pa.Table:
+    if isinstance(source, str):
         fenix.io.coder.load(root, name)
 
-        path = os.path.join(root, LOCATION, data, column, name + ".arrow")
+        path = os.path.join(root, LOCATION, source, column, name + ".arrow")
 
         return fenix.io.table.join(
-            fenix.io.table.load(root, data),
+            fenix.io.table.load(root, source),
             fenix.io.arrow.load(path),
             axis=1,
         )
 
-    assert isinstance(data, Sequence) and not isinstance(data, str)
+    assert isinstance(source, Sequence) and not isinstance(source, str)
     return fenix.io.table.join(
-        *[load(root, name, data, column) for data in data],
+        *[load(root, name, source, column) for source in source],
     )
 
 
-def make(root: str, name: str, data: str | Sequence[str], column: str) -> pa.Table:
-    if isinstance(data, str):
-        path = os.path.join(root, LOCATION, data, column, name + ".arrow")
+def make(root: str, name: str, source: str | Sequence[str], column: str) -> pa.Table:
+    if isinstance(source, str):
+        path = os.path.join(root, LOCATION, source, column, name + ".arrow")
 
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
         fenix.io.coder.load(root, name)
 
         def record_batch_generator() -> Iterator[pa.RecordBatch]:
-            for code in fenix.io.table.load(root, data).to_reader():
+            for code in fenix.io.table.load(root, source).to_reader():
                 code = code.column(column)
                 code = pc.call_function(name, [code, pa.scalar(1)])
                 code = pc.list_element(code, 0)
@@ -57,11 +57,11 @@ def make(root: str, name: str, data: str | Sequence[str], column: str) -> pa.Tab
             ),
         )
 
-        return load(root, name, data, column)
+        return load(root, name, source, column)
 
-    assert isinstance(data, Sequence) and not isinstance(data, str)
+    assert isinstance(source, Sequence) and not isinstance(source, str)
     return fenix.io.table.join(
-        *[make(root, name, data, column) for data in data],
+        *[make(root, name, source, column) for source in source],
     )
 
 
@@ -71,8 +71,8 @@ def list(root: str) -> Iterator[str]:
             yield path.removesuffix(".arrow")
 
 
-def drop(root: str, name: str, data: str, column: str) -> None:
-    path = os.path.join(root, LOCATION, data, column, name + ".arrow")
+def drop(root: str, name: str, source: str, column: str) -> None:
+    path = os.path.join(root, LOCATION, source, column, name + ".arrow")
 
     if os.path.exists(path):
         os.unlink(path)
@@ -80,8 +80,8 @@ def drop(root: str, name: str, data: str, column: str) -> None:
 
 def call(
     root: str,
-    name: str | None,
-    data: str | Sequence[str] | pa.Table,
+    coding: str | None,
+    source: str | Sequence[str] | pa.Table,
     column: str,
     target: pa.Array | pa.ChunkedArray | pa.FixedSizeListScalar | np.ndarray | Tensor,
     metric: str | None = None,
@@ -90,11 +90,11 @@ def call(
     maxval: int | None = None,
     probes: int | None = None,
 ) -> pa.Table:
-    if not isinstance(data, pa.Table):
-        if name is not None:
-            data = load(root, name, data, column)
+    if not isinstance(source, pa.Table):
+        if coding is not None:
+            data = load(root, coding, source, column)
         else:
-            data = fenix.io.table.load(root, data)
+            data = fenix.io.table.load(root, source)
 
     type = data.schema.field(column).type
 
@@ -110,14 +110,14 @@ def call(
     if isinstance(target, np.ndarray):
         target = pa.scalar(target, type=type)
 
-    if name is not None and probes is not None:
-        code = fenix.io.coder.load(root, name)
+    if coding is not None and probes is not None:
+        code = fenix.io.coder.load(root, coding)
 
         if metric is None:
             metric = code["config"]["metric"]
 
         mask = pc.field(CODE_COL).isin(
-            pc.call_function(name, [pa.array([target]), probes]).values,
+            pc.call_function(coding, [pa.array([target]), probes]).values,
         )
 
         if filter is None:

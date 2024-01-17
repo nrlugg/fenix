@@ -50,7 +50,7 @@ def distance(u: Tensor, v: Tensor, metric: str) -> Tensor:
     raise ValueError()
 
 
-def kmeans(q: Tensor, v: Tensor, metric: str) -> Tensor:
+def update(q: Tensor, v: Tensor, metric: str) -> Tensor:
     if metric == "cosine":
         q = F.normalize(q, dim=-1)
         v = F.normalize(v, dim=-1)
@@ -68,6 +68,8 @@ def kmeans(q: Tensor, v: Tensor, metric: str) -> Tensor:
 def load(root: str, name: str) -> Coding:
     path = os.path.join(root, LOCATION, name + ".torch")
 
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
     with open(path, "rb") as f:
         data: Coding = torch.load(f, map_location="cpu")
 
@@ -75,11 +77,11 @@ def load(root: str, name: str) -> Coding:
 
     if name not in pc.list_functions():
 
-        def topk(ctx: pc.UdfContext, x: pa.FixedSizeListArray, k: pa.Int64Scalar) -> pa.ListArray:
-            return call(data, x, k.as_py())
+        def func(ctx: pc.UdfContext, x: pa.FixedSizeListArray, k: pa.Int64Scalar) -> pa.ListArray:
+            return call(x, data, k.as_py())
 
         pc.register_scalar_function(
-            topk,
+            func,
             name,
             {"summary": "", "description": ""},
             {"x": column, "k": pa.int64()},
@@ -89,38 +91,38 @@ def load(root: str, name: str) -> Coding:
     return data
 
 
-def make(root: str, name: str, data: str | Sequence[str], column: str, config: Config) -> Coding:
-    update = torch.compile(torch.vmap(kmeans))
-    source = fenix.io.table.load(root, data)
+def make(root: str, name: str, source: str | Sequence[str], column: str, config: Config) -> Coding:
+    func = torch.compile(torch.vmap(update))
+    data = fenix.io.table.load(root, source)
 
     filter = (
-        np.random.permutation(source.num_rows) < config["codebook_size"] * config["num_codebooks"]
+        np.random.permutation(data.num_rows) < config["codebook_size"] * config["num_codebooks"]
     )
 
     coding = fenix.io.torch.from_arrow(
-        source.filter(filter).column(column).combine_chunks(),
+        data.filter(filter).column(column).combine_chunks(),
     ).view(config["num_codebooks"], config["codebook_size"], -1)
 
     for _ in range(config["num_epochs"]):
         batch_size = config["num_codebooks"] * config["batch_size"]
-        batch_rows = np.random.permutation(source.num_rows)
+        batch_rows = np.random.permutation(data.num_rows)
         batch_rows = batch_rows[: batch_rows.size // batch_size * batch_size]
 
         for indices in tqdm(np.array_split(batch_rows, batch_rows.size // batch_size)):
-            np.put(filter := np.zeros(source.num_rows, dtype=np.bool_), indices, True)
+            np.put(filter := np.zeros(data.num_rows, dtype=np.bool_), indices, True)
 
             sample = fenix.io.torch.from_arrow(
-                source.filter(filter).column(column).combine_chunks()
+                data.filter(filter).column(column).combine_chunks()
             ).view(config["num_codebooks"], config["batch_size"], -1)
 
-            coding = update(coding, sample, metric=config["metric"])
+            coding = func(coding, sample, metric=config["metric"])
 
     path = os.path.join(root, LOCATION, name + ".torch")
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     with open(path, "wb") as f:
-        torch.save({"tensor": coding, "column": source.column(column).type, "config": config}, f)
+        torch.save({"tensor": coding, "column": data.column(column).type, "config": config}, f)
 
     return load(root, name)
 
@@ -139,28 +141,34 @@ def drop(root: str, name: str) -> None:
 
 
 def call(
-    code: Coding | tuple[str, str],
-    data: Tensor | pa.FixedSizeListArray | pa.Table,
-    topk: int | None = None,
+    target: np.ndarray | Tensor | pa.FixedSizeListArray | pa.Table,
+    coding: Coding | tuple[str, str],
+    maxval: int | None = None,
 ) -> Tensor | pa.ListArray:
-    return_torch = isinstance(data, Tensor)
+    return_torch = isinstance(target, Tensor)
+    return_numpy = isinstance(target, np.ndarray)
 
-    if isinstance(code, tuple):
-        code = load(*code)
+    if isinstance(coding, tuple):
+        coding = load(*coding)
 
-    n = code["config"]["num_codebooks"]
-    k = code["config"]["codebook_size"]
-    column = code["column"]
-    metric = code["config"]["metric"]
-    coding = code["tensor"]
+    n = coding["config"]["num_codebooks"]
+    k = coding["config"]["codebook_size"]
+    column = coding["column"]
+    metric = coding["config"]["metric"]
+    tensor = coding["tensor"]
 
-    if isinstance(data, pa.Table):
-        data = data.column(column)
+    if isinstance(target, pa.Table):
+        target = target.column(column).combine_chunks()
 
-    if not isinstance(data, Tensor):
-        data = fenix.io.torch.from_arrow(data)
+    if isinstance(target, pa.Array):
+        target = fenix.io.torch.from_arrow(target)
 
-    data = distance(data, coding.flatten(end_dim=-2), metric=metric).view(-1, n, k)
+    if isinstance(target, np.ndarray):
+        target = torch.from_numpy(target)
+
+    assert isinstance(target, Tensor)
+
+    data = distance(target, tensor.flatten(end_dim=-2), metric=metric).view(-1, n, k)
     data = sum(
         [
             data[:, j, i]
@@ -172,12 +180,15 @@ def call(
         torch.tensor(0),
     )
 
-    if topk is not None:
-        data = torch.topk(data, topk, largest=False).indices
+    if maxval is not None:
+        data = torch.topk(data, maxval, largest=False).indices
     else:
         data = torch.argsort(data, descending=False)
 
     if return_torch:
         return data
+
+    if return_numpy:
+        return data.numpy()
 
     return pa.array(iter(data.numpy()), type=pa.list_(pa.int64()))
