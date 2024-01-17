@@ -288,5 +288,5 @@ class Flight:
             return reader.read_all()
 
     def remove(self) -> Self:
-        self.conn.do_action(fl.Action("remove", bytes()))
+        self.conn.do_action(fl.Action("remove", pickle.dumps({})))
         return self
