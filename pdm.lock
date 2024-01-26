@@ -5,7 +5,7 @@
 groups = ["default", "dev"]
 strategy = ["cross_platform"]
 lock_version = "4.4"
-content_hash = "sha256:572e2f5b499d62505f6d61636c1290b3a30d9b338592b8eaefd12df1d31e89cc"
+content_hash = "sha256:8006c29bee3b1113f88b1fe5a68efb0f206167997da54a6cbdd1a159100e222d"
 
 [[package]]
 name = "annotated-types"
@@ -1367,6 +1367,23 @@ summary = "Pygments is a syntax highlighting package written in Python."
 files = [
     {file = "pygments-2.17.2-py3-none-any.whl", hash = "sha256:b27c2826c47d0f3219f29554824c30c5e8945175d888647acd804ddd04af846c"},
     {file = "pygments-2.17.2.tar.gz", hash = "sha256:da46cec9fd2de5be3a8a784f434e4c4ab670b4ff54d605c4c2717e9d49c4c367"},
+]
+
+[[package]]
+name = "pylance"
+version = "0.9.9"
+requires_python = ">=3.8"
+summary = "python wrapper for Lance columnar format"
+dependencies = [
+    "numpy>=1.22",
+    "pyarrow>=12",
+]
+files = [
+    {file = "pylance-0.9.9-cp38-abi3-macosx_10_15_x86_64.whl", hash = "sha256:ccfa0649b0cbaf2e23203636c3aab0defb33edc7d30d04d531beb3037f5f78ae"},
+    {file = "pylance-0.9.9-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:10f100667ccc954f8b7e62836d4ee99434ce78dc2a02ec44060f74082149f725"},
+    {file = "pylance-0.9.9-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:606cf2cc5cbba24bab737ac1778d4bdca5f28ef2aee95049f73517bee35faabe"},
+    {file = "pylance-0.9.9-cp38-abi3-manylinux_2_24_aarch64.whl", hash = "sha256:ded74c6452cc96224377aec34e18924e175af4c5d1f09d8047d44d1a858a7131"},
+    {file = "pylance-0.9.9-cp38-abi3-win_amd64.whl", hash = "sha256:e93d1456a796e871f08a69e426395b6593269298a3d3c0a2e0bbcd9c120996bd"},
 ]
 
 [[package]]
